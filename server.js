@@ -156,6 +156,998 @@ app.get("/api/config", (req, res) => {
   });
 });
 
+// In-memory cache of the remote profile lookup. Keyed by token (in case the
+// access token rotates). 60-second TTL keeps page reloads from hammering the
+// upstream API while staying fresh enough for an account view.
+const PROFILE_CACHE_MS = 60_000;
+let profileCache = { token: null, data: null, expiresAt: 0 };
+
+async function fetchAnthropicProfile(token) {
+  if (profileCache.token === token && Date.now() < profileCache.expiresAt) {
+    return { data: profileCache.data, fromCache: true };
+  }
+  const res = await fetch("https://api.anthropic.com/api/oauth/profile", {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "User-Agent": "claude-lens/1.0",
+    },
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) {
+    const err = new Error(`http_${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  const data = await res.json();
+  profileCache = { token, data, expiresAt: Date.now() + PROFILE_CACHE_MS };
+  return { data, fromCache: false };
+}
+
+// Strip any unknown fields out of the upstream payload before forwarding, so
+// future server-side additions don't accidentally leak through this endpoint.
+function projectProfile(profile) {
+  if (!profile || typeof profile !== "object") return null;
+  const a = profile.account || {};
+  const o = profile.organization || {};
+  const app = profile.application || {};
+  return {
+    account: {
+      uuid: a.uuid ?? null,
+      fullName: a.full_name ?? null,
+      displayName: a.display_name ?? null,
+      email: a.email ?? null,
+      hasClaudeMax: a.has_claude_max ?? null,
+      hasClaudePro: a.has_claude_pro ?? null,
+      createdAt: a.created_at ?? null,
+    },
+    organization: {
+      uuid: o.uuid ?? null,
+      name: o.name ?? null,
+      organizationType: o.organization_type ?? null,
+      billingType: o.billing_type ?? null,
+      rateLimitTier: o.rate_limit_tier ?? null,
+      seatTier: o.seat_tier ?? null,
+      hasExtraUsageEnabled: o.has_extra_usage_enabled ?? null,
+      subscriptionStatus: o.subscription_status ?? null,
+      subscriptionCreatedAt: o.subscription_created_at ?? null,
+      claudeCodeTrialEndsAt: o.claude_code_trial_ends_at ?? null,
+      claudeCodeTrialDurationDays: o.claude_code_trial_duration_days ?? null,
+    },
+    application: {
+      uuid: app.uuid ?? null,
+      name: app.name ?? null,
+      slug: app.slug ?? null,
+    },
+  };
+}
+
+// GET /api/account — read .credentials.json and surface SAFE fields only.
+// SECURITY: accessToken and refreshToken must never appear in the response.
+// They live in the local file but are never serialized over the wire. The
+// remote profile call uses the token server-side; only the projected fields
+// (see projectProfile) are forwarded to the browser.
+app.get("/api/account", async (req, res) => {
+  const credPath = path.join(CLAUDE_DIR, ".credentials.json");
+  try {
+    if (!fs.existsSync(credPath)) {
+      return res.json({
+        loggedIn: false,
+        reason: "credentials_missing",
+        credentialsPath: credPath,
+      });
+    }
+
+    let raw;
+    try {
+      raw = JSON.parse(fs.readFileSync(credPath, "utf8"));
+    } catch (parseErr) {
+      return res.json({
+        loggedIn: false,
+        reason: "credentials_unreadable",
+        message: parseErr.message,
+        credentialsPath: credPath,
+      });
+    }
+
+    const oauth = raw.claudeAiOauth || {};
+    const hasToken = typeof oauth.accessToken === "string" && oauth.accessToken.length > 0;
+    if (!hasToken) {
+      return res.json({
+        loggedIn: false,
+        reason: "no_access_token",
+        credentialsPath: credPath,
+      });
+    }
+
+    const now = Date.now();
+    const expiresAt = typeof oauth.expiresAt === "number" ? oauth.expiresAt : null;
+    const expiresInMs = expiresAt != null ? expiresAt - now : null;
+    const expired = expiresAt != null ? expiresAt <= now : null;
+
+    // Optionally skip the remote fetch with ?local=1 — handy for offline use
+    // and for testing the local-only path.
+    let profile = null;
+    let profileError = null;
+    let profileFromCache = false;
+    if (req.query.local !== "1") {
+      try {
+        const result = await fetchAnthropicProfile(oauth.accessToken);
+        profile = projectProfile(result.data);
+        profileFromCache = result.fromCache;
+      } catch (e) {
+        profileError = e.status ? `http_${e.status}` : (e.name === "TimeoutError" ? "timeout" : e.message || "unknown");
+      }
+    }
+
+    res.json({
+      loggedIn: true,
+      subscriptionType: oauth.subscriptionType || null,
+      rateLimitTier: oauth.rateLimitTier || null,
+      scopes: Array.isArray(oauth.scopes) ? oauth.scopes : [],
+      expiresAt,
+      expiresInMs,
+      expired,
+      organizationUuid: raw.organizationUuid || null,
+      credentialsPath: credPath,
+      profile,
+      profileError,
+      profileFromCache,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /account — serve the account page
+app.get("/account", (req, res) => {
+  res.sendFile(path.join(__dirname, "account.html"));
+});
+
+// GET /chat — serve the chat page
+app.get("/chat", (req, res) => {
+  res.sendFile(path.join(__dirname, "chat.html"));
+});
+
+// Allow-list of models exposed to the chat UI. Keep narrow on purpose — if the
+// user wants something else, add it here explicitly. Prevents typo'd model
+// names from generating cryptic upstream errors.
+const CHAT_MODELS = new Set([
+  "claude-opus-4-7",
+  "claude-sonnet-4-6",
+  "claude-haiku-4-5-20251001",
+]);
+
+// === AI insight templates ===
+//
+// Each kind defines a system prompt, a function that turns the structured
+// payload from the client into the user message, and a max_tokens cap.
+// Always run on Haiku 4.5 so the cost-per-insight stays in the
+// fraction-of-a-cent range. Results are cached client-side; this endpoint
+// is intentionally stateless and never auto-fires.
+const AI_MODEL = "claude-haiku-4-5-20251001";
+
+function fmtNum(n) {
+  if (n == null) return "0";
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  return Number(n).toLocaleString();
+}
+
+function fmtModelMix(models) {
+  if (!models || typeof models !== "object") return "n/a";
+  const entries = Object.entries(models).sort((a, b) => b[1] - a[1]);
+  if (entries.length === 0) return "n/a";
+  return entries.slice(0, 3).map(([m, c]) => `${m} (${c})`).join(", ");
+}
+
+const AI_INSIGHTS = {
+  "daily-summary": {
+    system:
+      "You are a concise usage analyst. The user is viewing their personal Claude Code dashboard and wants a quick paragraph (3 to 5 sentences) summarising today's activity. Focus on: what shape today had, cache health, any notable cost or model shifts vs yesterday. Plain English. No emoji. No bullet points. No closing pleasantries. Just facts and observations.",
+    formatUser: (ctx) => {
+      const t = ctx.today || {};
+      const y = ctx.yesterday;
+      const all = ctx.allTime || {};
+      const lines = [];
+      lines.push(`TODAY (${t.date || "n/a"}, ${ctx.timezone || "local"}):`);
+      lines.push(`- Sessions: ${t.sessions || 0}, messages: ${t.messages || 0}, tool calls: ${t.toolCalls || 0}`);
+      lines.push(`- Tokens — input: ${fmtNum(t.input)}, output: ${fmtNum(t.output)}, cache read: ${fmtNum(t.cacheRead)}, cache write: ${fmtNum(t.cacheCreate)}`);
+      lines.push(`- Cache hit rate: ${(t.hitRate ?? 0).toFixed(1)}%`);
+      lines.push(`- Estimated cost: $${(t.cost || 0).toFixed(2)}`);
+      lines.push(`- Top models: ${fmtModelMix(t.models)}`);
+      if (y) {
+        lines.push("");
+        lines.push(`YESTERDAY (${y.date}): ${y.sessions || 0} sessions, ${(y.hitRate ?? 0).toFixed(1)}% hit rate, $${(y.cost || 0).toFixed(2)} cost, top models ${fmtModelMix(y.models)}`);
+      } else {
+        lines.push("");
+        lines.push("YESTERDAY: no data on disk.");
+      }
+      lines.push("");
+      lines.push(`ALL TIME: ${all.sessions || 0} session-days, ${(all.hitRate ?? 0).toFixed(1)}% hit rate, $${(all.cost || 0).toFixed(2)} estimated cost.`);
+      return lines.join("\n");
+    },
+    max_tokens: 350,
+  },
+
+  "project-narrative": {
+    system:
+      "You are summarising what a developer has been working on in a specific project, given recent prompts they typed. Write 2 to 4 sentences capturing themes, not a list. Plain English. No emoji. Don't quote prompts verbatim — paraphrase.",
+    formatUser: (ctx) => {
+      const lines = [];
+      lines.push(`Project: ${ctx.projectName || "unknown"}`);
+      lines.push(`Activity: ${ctx.messages || 0} messages across ${ctx.sessions || 0} sessions. Last active ${ctx.lastSeen || "n/a"}.`);
+      lines.push("");
+      lines.push("Recent prompts (newest first):");
+      const prompts = Array.isArray(ctx.prompts) ? ctx.prompts.slice(0, 30) : [];
+      if (prompts.length === 0) {
+        lines.push("- (no prompt text available)");
+      } else {
+        for (const p of prompts) lines.push(`- ${String(p).slice(0, 240)}`);
+      }
+      return lines.join("\n");
+    },
+    max_tokens: 280,
+  },
+
+  "cache-diagnosis": {
+    system:
+      "You are a usage analyst diagnosing Anthropic prompt-cache performance for a developer. Given daily cache statistics, write 3 to 5 sentences explaining what the hit rate looks like and why, and suggest one or two concrete actions if it is below 70%. Plain English. No emoji. Don't repeat the raw numbers — interpret them.",
+    formatUser: (ctx) => {
+      const lines = [];
+      lines.push(`Cache statistics over the selected date range (${ctx.rangeLabel || "all time"}):`);
+      const days = (ctx.days || []).slice(-14);
+      for (const d of days) {
+        lines.push(`- ${d.date}: hit rate ${(d.hitRate ?? 0).toFixed(1)}%, ${d.sessions || 0} sessions, ${fmtNum(d.cacheRead)} cache reads, ${fmtNum(d.cacheCreate)} cache writes, $${(d.cost || 0).toFixed(2)} cost`);
+      }
+      const t = ctx.totals || {};
+      const totalInput = (t.input || 0) + (t.cacheRead || 0) + (t.cacheCreate || 0);
+      lines.push("");
+      lines.push(`Totals: ${fmtNum(t.cacheRead)} cache reads of ${fmtNum(totalInput)} input tokens (${totalInput > 0 ? ((t.cacheRead || 0) / totalInput * 100).toFixed(1) : "0"}% overall hit rate).`);
+      return lines.join("\n");
+    },
+    max_tokens: 350,
+  },
+
+  "tool-summary": {
+    system:
+      "You are summarising a developer's recent tool usage in Claude Code. Given a sample of invocations of one specific tool, group them and write 3 to 5 sentences capturing themes (what kinds of commands, files, or patterns dominate). Plain English. No bullet lists. No emoji.",
+    formatUser: (ctx) => {
+      const lines = [];
+      lines.push(`Tool: ${ctx.tool || "unknown"}`);
+      lines.push(`Total invocations: ${ctx.totalCount || 0} (sample of ${(ctx.calls || []).length} most recent shown).`);
+      lines.push("");
+      const calls = Array.isArray(ctx.calls) ? ctx.calls.slice(0, 60) : [];
+      for (const c of calls) {
+        const summary = JSON.stringify(c).slice(0, 280);
+        lines.push(`- ${summary}`);
+      }
+      return lines.join("\n");
+    },
+    max_tokens: 320,
+  },
+
+  "conversation-title": {
+    system:
+      "Given the first user message and the first assistant response of a conversation, output a 3 to 6 word title that captures the topic. Output ONLY the title — no quotes, no trailing punctuation, no preamble like 'Title:'.",
+    formatUser: (ctx) => {
+      const u = String(ctx.userMsg || "").slice(0, 600);
+      const a = String(ctx.assistantMsg || "").slice(0, 600);
+      return `USER: ${u}\n\nASSISTANT: ${a}`;
+    },
+    max_tokens: 30,
+  },
+
+  "conversation-summary": {
+    system:
+      "Summarise this conversation in 3 to 5 sentences. Capture (1) what the user was trying to do, (2) what was figured out, (3) any open threads or next steps. Plain English. No emoji. No closing pleasantries.",
+    formatUser: (ctx) => {
+      const msgs = Array.isArray(ctx.messages) ? ctx.messages : [];
+      return msgs
+        .map(m => `${(m.role || "?").toUpperCase()}: ${String(m.content || "").slice(0, 1500)}`)
+        .join("\n\n");
+    },
+    max_tokens: 400,
+  },
+
+  "ask": {
+    system:
+      "You are a usage analyst answering a developer's natural-language question about their personal Claude Code dashboard. Use the provided structured snapshot. If the data does not contain what is needed to answer, say so plainly — do not invent numbers. Cite figures when relevant. Plain English, 1 to 5 sentences. No emoji.",
+    formatUser: (ctx) => {
+      const snapshot = ctx.snapshot ? JSON.stringify(ctx.snapshot, null, 2) : "(no snapshot)";
+      return `User question: ${ctx.question || ""}\n\nDashboard snapshot:\n${snapshot}`;
+    },
+    max_tokens: 500,
+  },
+
+  "cost-forecast": {
+    system:
+      "You are a usage analyst commenting on a cost projection. Given a 7-day rolling daily-cost average, this month's spend so far, and a linear projection to month-end, write 1 to 3 sentences interpreting whether the trend is on track, elevated, or below baseline, and whether the projection looks credible (e.g. early in the month, recent spike, etc). Plain English. No emoji. No bullet points. Don't repeat raw numbers — interpret them.",
+    formatUser: (ctx) => {
+      const days = ctx.last7 || [];
+      const recentLines = days.map(d => `- ${d.date}: $${(d.cost || 0).toFixed(2)}`);
+      const lines = [
+        `Today (${ctx.today || "n/a"}, ${ctx.timezone || "local"}): $${(ctx.todayCost || 0).toFixed(2)}`,
+        `This month so far (day ${ctx.daysIntoMonth || 0} of ${ctx.daysInMonth || 0}): $${(ctx.monthToDate || 0).toFixed(2)}`,
+        `7-day rolling daily average: $${(ctx.rolling7AvgCost || 0).toFixed(2)}`,
+        `Projected month-end total: $${(ctx.projectedMonthTotal || 0).toFixed(2)} (${ctx.daysRemainingInMonth || 0} days remaining at the rolling avg)`,
+        "",
+        "Recent daily costs (oldest → newest):",
+        ...recentLines,
+      ];
+      return lines.join("\n");
+    },
+    max_tokens: 200,
+  },
+
+  "standup-prep": {
+    system:
+      "You are summarising what a developer did recently for a daily / weekly standup. Output Markdown in exactly this structure (omit a section if empty):\n\n**Recent work**\n- one bullet per project, 1 short sentence each, capturing themes (don't quote prompts verbatim)\n\n**Likely up next**\n- 1 to 2 bullets inferring what's queued based on the most recent activity\n\n**Open threads / friction**\n- 0 to 2 bullets if there are signs of debugging loops, repeated failures, or stuck flows; skip this section entirely if none\n\nReference projects by their short name. Be concise. No emoji. No closing pleasantries.",
+    formatUser: (ctx) => {
+      const projects = ctx.projects || [];
+      const blocks = projects.map(proj => {
+        const prompts = Array.isArray(proj.prompts) ? proj.prompts.slice(0, 12) : [];
+        const promptLines = prompts.length === 0
+          ? ["- (no prompt text available)"]
+          : prompts.map(p => `- ${String(p).slice(0, 220)}`);
+        return [
+          `### ${proj.shortName} (${proj.fullPath})`,
+          `Activity: ${proj.messages || 0} messages across ${proj.sessions || 0} sessions, last active ${proj.lastSeen || "n/a"}.`,
+          "Recent prompts (newest first):",
+          ...promptLines,
+          "",
+        ].join("\n");
+      });
+      const header = [
+        `Time range: ${ctx.rangeLabel || "recent"} (${ctx.timezone || "local"})`,
+        `Total prompts in range: ${ctx.totalPrompts || 0} across ${projects.length} projects.`,
+        "",
+      ].join("\n");
+      return header + blocks.join("\n");
+    },
+    max_tokens: 700,
+  },
+
+  "conversation-compact": {
+    system:
+      "You are compacting an older portion of a developer's chat conversation so it can be replaced with a single message that preserves the load-bearing context. Given the older turns (USER / ASSISTANT alternating), produce a markdown summary that captures: (1) the goal and scope of what's been discussed, (2) the key decisions or conclusions reached, (3) any unresolved questions, (4) any specific code, file paths, names, or facts the assistant should remember (verbatim if they're identifiers). Aim for compression — typically 5 to 12 sentences total — but never drop names, paths, or numeric facts. No emoji. No closing pleasantries. Do not address the user directly. Begin the output with `Earlier in this conversation:` so it reads as a context handoff.",
+    formatUser: (ctx) => {
+      const msgs = Array.isArray(ctx.messages) ? ctx.messages : [];
+      return msgs
+        .map(m => `${(m.role || "?").toUpperCase()}: ${String(m.content || "").slice(0, 2500)}`)
+        .join("\n\n");
+    },
+    max_tokens: 800,
+  },
+};
+
+// POST /api/chat — proxy /v1/messages with the local OAuth token.
+//
+// The browser sends the same JSON body shape Anthropic expects (model,
+// messages, max_tokens, etc.) and the server tacks on Authorization +
+// anthropic-beta headers, then pipes the upstream response (streaming or
+// not) straight back to the client. The access token is read from
+// .credentials.json on every request — never cached — and never appears
+// in the response body.
+//
+// Inference billed against the user's local Claude account quota
+// (no separate API key needed thanks to the `user:inference` scope).
+app.post("/api/chat", express.json({ limit: "25mb" }), async (req, res) => {
+  const credPath = path.join(CLAUDE_DIR, ".credentials.json");
+  let token;
+  try {
+    if (!fs.existsSync(credPath)) {
+      return res.status(401).json({ error: "not_logged_in", reason: "credentials_missing" });
+    }
+    const cred = JSON.parse(fs.readFileSync(credPath, "utf8"));
+    token = cred.claudeAiOauth?.accessToken;
+    if (!token) {
+      return res.status(401).json({ error: "not_logged_in", reason: "no_access_token" });
+    }
+  } catch (err) {
+    return res.status(500).json({ error: "credentials_read_error", message: err.message });
+  }
+
+  const body = req.body || {};
+  if (!body.model || !CHAT_MODELS.has(body.model)) {
+    return res.status(400).json({
+      error: "bad_model",
+      message: `Model not in allow-list. Pick one of: ${[...CHAT_MODELS].join(", ")}`,
+    });
+  }
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    return res.status(400).json({ error: "bad_messages", message: "messages must be a non-empty array" });
+  }
+
+  // === Claude-Code identity injection ===
+  //
+  // Anthropic gates the OAuth-friendly rate-limit bucket behind the EXACT
+  // string below appearing as a system block. Without it, OAuth requests
+  // share a much smaller quota and 429 quickly even with the same token —
+  // confirmed by probing: a string-form `system: "<marker>\n\n..."` 429s,
+  // but `system: [{type:"text", text:"<marker>"}, {type:"text", text:"..."}]`
+  // gets through. So we always force the system field into block-array
+  // form with the marker as the first block.
+  //
+  // The second block tells Claude it's in conversational chat mode
+  // (no tools, no workspace) so responses don't default to the code-focused
+  // Claude Code persona.
+  const CC_SYSTEM_MARKER = "You are Claude Code, Anthropic's official CLI for Claude.";
+  const CHAT_CONTEXT_BLOCK = "You are running in conversational chat mode inside claude-lens, a local web UI. The user is having a normal conversation — coding-related or not. You have no file access, no tool use, and no workspace in this session. Respond naturally; do not assume the user wants you to write code unless they explicitly ask.";
+
+  const userSystem = body.system;
+  const extraBlocks = [];
+  if (typeof userSystem === "string" && userSystem.trim().length > 0) {
+    extraBlocks.push({ type: "text", text: userSystem });
+  } else if (Array.isArray(userSystem)) {
+    for (const block of userSystem) {
+      // Don't re-add a block that already matches the marker exactly
+      if (block?.type === "text" && block?.text === CC_SYSTEM_MARKER) continue;
+      extraBlocks.push(block);
+    }
+  }
+  body.system = [
+    { type: "text", text: CC_SYSTEM_MARKER },
+    { type: "text", text: CHAT_CONTEXT_BLOCK },
+    ...extraBlocks,
+  ];
+
+  let upstreamRes;
+  try {
+    upstreamRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-lens/1.0",
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    return res.status(502).json({ error: "upstream_unreachable", message: err.message });
+  }
+
+  // Pass status + content-type through; stream body chunk-by-chunk so SSE
+  // events reach the browser as they arrive.
+  res.status(upstreamRes.status);
+  const ct = upstreamRes.headers.get("content-type");
+  if (ct) res.setHeader("Content-Type", ct);
+
+  // Forward Anthropic's rate-limit headers + retry-after so the UI can
+  // explain 429s instead of just throwing "HTTP 429".
+  for (const [name, value] of upstreamRes.headers) {
+    const n = name.toLowerCase();
+    if (n.startsWith("anthropic-ratelimit-") || n === "retry-after" || n === "anthropic-request-id") {
+      res.setHeader(name, value);
+    }
+  }
+
+  // Disable proxy buffering for SSE
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("X-Accel-Buffering", "no");
+
+  if (!upstreamRes.body) {
+    return res.end();
+  }
+  const reader = upstreamRes.body.getReader();
+  req.on("close", () => {
+    // Client disconnected — abort upstream read so we stop billing tokens
+    try { reader.cancel("client_disconnected"); } catch {}
+  });
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(value);
+    }
+  } catch (err) {
+    // Pipe errors usually mean the client disconnected mid-stream
+  } finally {
+    res.end();
+  }
+});
+
+// POST /api/ai-insight — generate a short paragraph for one of the
+// pre-defined dashboard insight kinds (daily-summary, project-narrative,
+// cache-diagnosis, tool-summary, conversation-title, conversation-summary,
+// ask). Always uses Haiku for cost control. Stateless — caching is the
+// caller's job (the dashboard caches by kind+context-hash in localStorage).
+app.post("/api/ai-insight", express.json({ limit: "2mb" }), async (req, res) => {
+  const credPath = path.join(CLAUDE_DIR, ".credentials.json");
+  let token;
+  try {
+    if (!fs.existsSync(credPath)) {
+      return res.status(401).json({
+        error: "not_logged_in",
+        reason: "credentials_missing",
+        message: "Not signed in to Claude. Run `claude /login` in a terminal first, then reload this page.",
+      });
+    }
+    const cred = JSON.parse(fs.readFileSync(credPath, "utf8"));
+    token = cred.claudeAiOauth?.accessToken;
+    if (!token) {
+      return res.status(401).json({
+        error: "not_logged_in",
+        reason: "no_access_token",
+        message: "Credentials file exists but contains no access token. Try `claude /logout` then `claude /login` to refresh it.",
+      });
+    }
+  } catch (err) {
+    return res.status(500).json({
+      error: "credentials_read_error",
+      message: `Could not read credentials.json: ${err.message}`,
+    });
+  }
+
+  const { kind, context } = req.body || {};
+  const tmpl = AI_INSIGHTS[kind];
+  if (!tmpl) {
+    return res.status(400).json({ error: "bad_kind", message: `Unknown insight kind: ${kind}. Valid: ${Object.keys(AI_INSIGHTS).join(", ")}` });
+  }
+
+  let userMessage;
+  try {
+    userMessage = tmpl.formatUser(context || {});
+  } catch (err) {
+    return res.status(400).json({ error: "bad_context", message: err.message });
+  }
+
+  const body = {
+    model: AI_MODEL,
+    max_tokens: tmpl.max_tokens || 400,
+    system: [
+      { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+      { type: "text", text: tmpl.system },
+    ],
+    messages: [{ role: "user", content: userMessage }],
+  };
+
+  let upstreamRes;
+  try {
+    upstreamRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-lens/1.0",
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    return res.status(502).json({ error: "upstream_unreachable", message: err.message });
+  }
+
+  // Forward rate-limit headers so the UI can surface 429 reasons
+  for (const [name, value] of upstreamRes.headers) {
+    const n = name.toLowerCase();
+    if (n.startsWith("anthropic-ratelimit-") || n === "retry-after" || n === "anthropic-request-id") {
+      res.setHeader(name, value);
+    }
+  }
+
+  if (!upstreamRes.ok) {
+    const errText = await upstreamRes.text().catch(() => "");
+    let parsed = null;
+    try { parsed = JSON.parse(errText); } catch { /* ignore */ }
+    return res.status(upstreamRes.status).json({
+      error: parsed?.error?.type || "upstream_error",
+      message: parsed?.error?.message || errText || `HTTP ${upstreamRes.status}`,
+    });
+  }
+
+  let anth;
+  try {
+    anth = await upstreamRes.json();
+  } catch (err) {
+    return res.status(502).json({ error: "upstream_parse_error", message: err.message });
+  }
+  const text = (anth.content || [])
+    .filter(c => c && c.type === "text" && typeof c.text === "string")
+    .map(c => c.text)
+    .join("")
+    .trim();
+  const usage = anth.usage || {};
+  res.json({
+    kind,
+    text,
+    model: anth.model || AI_MODEL,
+    usage: {
+      input_tokens: usage.input_tokens || 0,
+      output_tokens: usage.output_tokens || 0,
+      cache_read_input_tokens: usage.cache_read_input_tokens || 0,
+      cache_creation_input_tokens: usage.cache_creation_input_tokens || 0,
+    },
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// === OpenAI-compatible API ===
+//
+// Lets external clients (OpenAI Python/JS SDKs, curl, etc.) talk to the
+// user's local Claude account using the OpenAI Chat Completions wire shape.
+// Translates request/response/stream between OpenAI and Anthropic, and
+// reuses the same OAuth-based proxy logic as /api/chat (so the load-bearing
+// system marker is injected automatically and the same quota applies).
+
+// Optional API key. If LOCAL_API_KEY is set in .env, callers must send
+// `Authorization: Bearer <key>`. Unset → no auth (trust localhost).
+const LOCAL_API_KEY = process.env.LOCAL_API_KEY || null;
+
+function checkLocalApiKey(req, res) {
+  if (!LOCAL_API_KEY) return true;
+  const auth = req.headers.authorization || "";
+  const m = /^Bearer\s+(.+)$/i.exec(auth);
+  if (!m || m[1] !== LOCAL_API_KEY) {
+    res.status(401).json({
+      error: { type: "invalid_request_error", message: "Invalid or missing API key. Set LOCAL_API_KEY in .env to control this." },
+    });
+    return false;
+  }
+  return true;
+}
+
+// Map Anthropic stop_reason → OpenAI finish_reason.
+function mapStopReason(reason) {
+  if (!reason) return null;
+  if (reason === "end_turn") return "stop";
+  if (reason === "stop_sequence") return "stop";
+  if (reason === "max_tokens") return "length";
+  if (reason === "tool_use") return "tool_calls";
+  if (reason === "refusal") return "content_filter";
+  return "stop";
+}
+
+// Convert an OpenAI multimodal content array into Anthropic's block form.
+// Accepts a string (returned as-is) or an array of {type,text}/{type,image_url,...}.
+function convertOpenAIContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return String(content ?? "");
+  const blocks = [];
+  for (const item of content) {
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "text" && typeof item.text === "string") {
+      blocks.push({ type: "text", text: item.text });
+    } else if (item.type === "image_url") {
+      const url = typeof item.image_url === "string"
+        ? item.image_url
+        : (item.image_url && item.image_url.url) || "";
+      if (!url) continue;
+      const dataMatch = /^data:([^;,]+);base64,(.+)$/i.exec(url);
+      if (dataMatch) {
+        blocks.push({
+          type: "image",
+          source: { type: "base64", media_type: dataMatch[1], data: dataMatch[2] },
+        });
+      } else {
+        blocks.push({ type: "image", source: { type: "url", url } });
+      }
+    } else if (item.type === "input_audio") {
+      // Not supported — skip with a marker so the model still has context.
+      blocks.push({ type: "text", text: "[audio attachment — not supported by Claude]" });
+    }
+  }
+  return blocks.length > 0 ? blocks : "";
+}
+
+// Convert an OpenAI Chat Completions request body into the Anthropic shape.
+// Returns { body, warnings:[string] }.
+function openAIRequestToAnthropic(input) {
+  const warnings = [];
+  const body = {};
+
+  if (!input || typeof input !== "object") {
+    throw Object.assign(new Error("Request body must be an object"), { status: 400 });
+  }
+  if (!Array.isArray(input.messages) || input.messages.length === 0) {
+    throw Object.assign(new Error("messages must be a non-empty array"), { status: 400 });
+  }
+
+  body.model = input.model;
+
+  // Required by Anthropic. OpenAI's default is no cap; pick a sensible cap.
+  body.max_tokens = Number.isFinite(input.max_tokens) ? input.max_tokens : 4096;
+
+  if (Number.isFinite(input.temperature)) body.temperature = input.temperature;
+  if (Number.isFinite(input.top_p)) body.top_p = input.top_p;
+
+  if (typeof input.stop === "string") body.stop_sequences = [input.stop];
+  else if (Array.isArray(input.stop)) body.stop_sequences = input.stop.filter(s => typeof s === "string");
+
+  if (input.stream) body.stream = true;
+
+  // Pull system messages out of the messages array — Anthropic uses a
+  // separate `system` field. Concatenate them in the order they appeared.
+  const systemTexts = [];
+  const messages = [];
+  for (const m of input.messages) {
+    if (!m || typeof m !== "object" || !m.role) continue;
+    if (m.role === "system") {
+      const t = typeof m.content === "string" ? m.content : convertOpenAIContent(m.content);
+      if (typeof t === "string" && t.trim().length > 0) systemTexts.push(t);
+      // Note: arrays end up empty for systems — Anthropic system is text-only
+      continue;
+    }
+    if (m.role === "user" || m.role === "assistant") {
+      messages.push({ role: m.role, content: convertOpenAIContent(m.content) });
+    } else if (m.role === "tool") {
+      // Tool results — not supported in this minimal translation
+      warnings.push(`Ignored 'tool' message (function calling not yet supported)`);
+    }
+  }
+  if (systemTexts.length > 0) body.system = systemTexts.join("\n\n");
+  body.messages = messages;
+
+  // Warn about fields we silently drop so SDK clients don't get confused.
+  for (const f of ["frequency_penalty", "presence_penalty", "logit_bias", "response_format", "tools", "tool_choice", "n", "logprobs", "top_logprobs", "seed", "service_tier", "parallel_tool_calls"]) {
+    if (f in input) warnings.push(`Ignored unsupported field: ${f}`);
+  }
+
+  return { body, warnings };
+}
+
+// Convert a non-streaming Anthropic response into the OpenAI shape.
+function anthropicResponseToOpenAI(anth, model) {
+  const content = Array.isArray(anth.content) ? anth.content : [];
+  const text = content
+    .filter(c => c && c.type === "text" && typeof c.text === "string")
+    .map(c => c.text)
+    .join("");
+  const usage = anth.usage || {};
+  const promptTokens =
+    (usage.input_tokens || 0) +
+    (usage.cache_read_input_tokens || 0) +
+    (usage.cache_creation_input_tokens || 0);
+  const completionTokens = usage.output_tokens || 0;
+  return {
+    id: "chatcmpl-" + (anth.id ? anth.id.replace(/^msg_/, "") : Date.now().toString(36)),
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: model || anth.model,
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: text },
+        finish_reason: mapStopReason(anth.stop_reason),
+      },
+    ],
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens,
+      prompt_tokens_details: { cached_tokens: usage.cache_read_input_tokens || 0 },
+    },
+  };
+}
+
+// Convert Anthropic SSE stream → OpenAI streaming chunks. Reads from `reader`
+// and writes `data: {json}\n\n` (and a final `data: [DONE]\n\n`) to `res`.
+async function pipeAnthropicStreamAsOpenAI(reader, res, requestedModel, includeUsage) {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let chatId = "chatcmpl-" + Date.now().toString(36);
+  let modelOut = requestedModel || "";
+  let inputTokens = 0;
+  let cachedTokens = 0;
+  let outputTokens = 0;
+  let stopReason = null;
+  let openedRoleChunk = false;
+
+  const writeChunk = (delta, finishReason = null, usage = undefined) => {
+    const chunk = {
+      id: chatId,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: modelOut,
+      choices: [{ index: 0, delta, finish_reason: finishReason }],
+    };
+    if (usage) chunk.usage = usage;
+    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+  };
+
+  const handleEvent = (event, dataStr) => {
+    let data;
+    try { data = JSON.parse(dataStr); } catch { return; }
+    if (event === "message_start" && data.message) {
+      if (data.message.id) chatId = "chatcmpl-" + data.message.id.replace(/^msg_/, "");
+      if (data.message.model) modelOut = data.message.model;
+      const u = data.message.usage || {};
+      inputTokens = u.input_tokens || 0;
+      cachedTokens = u.cache_read_input_tokens || 0;
+      if (!openedRoleChunk) {
+        writeChunk({ role: "assistant", content: "" });
+        openedRoleChunk = true;
+      }
+    } else if (event === "content_block_delta" && data.delta && data.delta.type === "text_delta") {
+      writeChunk({ content: data.delta.text || "" });
+    } else if (event === "message_delta") {
+      if (data.delta && data.delta.stop_reason) stopReason = data.delta.stop_reason;
+      if (data.usage && Number.isFinite(data.usage.output_tokens)) outputTokens = data.usage.output_tokens;
+    } else if (event === "error") {
+      // Forward as a final chunk with finish_reason=stop so the client closes.
+      writeChunk({}, "stop");
+    }
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        const block = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        let event = "";
+        let data = "";
+        for (const line of block.split("\n")) {
+          if (line.startsWith("event:")) event = line.slice(6).trim();
+          else if (line.startsWith("data:")) data += line.slice(5).trim();
+        }
+        if (event && data) handleEvent(event, data);
+      }
+    }
+  } catch {
+    // Reader error — most likely client disconnect; just terminate the stream.
+  }
+
+  // Final chunk with finish_reason + optional usage
+  const finishReason = mapStopReason(stopReason) || "stop";
+  let usage;
+  if (includeUsage) {
+    const promptTokens = inputTokens + cachedTokens;
+    usage = {
+      prompt_tokens: promptTokens,
+      completion_tokens: outputTokens,
+      total_tokens: promptTokens + outputTokens,
+      prompt_tokens_details: { cached_tokens: cachedTokens },
+    };
+  }
+  writeChunk({}, finishReason, usage);
+  res.write("data: [DONE]\n\n");
+  res.end();
+}
+
+// GET /v1/models — OpenAI-compatible model listing
+app.get("/v1/models", (req, res) => {
+  if (!checkLocalApiKey(req, res)) return;
+  const created = Math.floor(Date.now() / 1000);
+  res.json({
+    object: "list",
+    data: [...CHAT_MODELS].map((id) => ({
+      id,
+      object: "model",
+      created,
+      owned_by: "anthropic",
+    })),
+  });
+});
+
+// POST /v1/chat/completions — OpenAI-compatible chat completion
+app.post("/v1/chat/completions", express.json({ limit: "25mb" }), async (req, res) => {
+  if (!checkLocalApiKey(req, res)) return;
+
+  // Read OAuth token from local credentials (same path as /api/chat)
+  const credPath = path.join(CLAUDE_DIR, ".credentials.json");
+  let token;
+  try {
+    if (!fs.existsSync(credPath)) {
+      return res.status(401).json({ error: { type: "authentication_error", message: "Not signed in. Run `claude /login` in a terminal first." } });
+    }
+    const cred = JSON.parse(fs.readFileSync(credPath, "utf8"));
+    token = cred.claudeAiOauth?.accessToken;
+    if (!token) {
+      return res.status(401).json({ error: { type: "authentication_error", message: "No access token in credentials file." } });
+    }
+  } catch (err) {
+    return res.status(500).json({ error: { type: "server_error", message: err.message } });
+  }
+
+  let translated;
+  try {
+    translated = openAIRequestToAnthropic(req.body || {});
+  } catch (err) {
+    return res.status(err.status || 400).json({ error: { type: "invalid_request_error", message: err.message } });
+  }
+  const { body: anthropicBody, warnings } = translated;
+
+  if (!anthropicBody.model || !CHAT_MODELS.has(anthropicBody.model)) {
+    return res.status(400).json({
+      error: { type: "invalid_request_error", message: `Model not in allow-list. Pick one of: ${[...CHAT_MODELS].join(", ")}` },
+    });
+  }
+
+  // Inject the load-bearing Claude-Code system marker (same as /api/chat).
+  // Without this block, OAuth requests share a much smaller quota and 429 quickly.
+  const userSystem = anthropicBody.system;
+  const extraBlocks = [];
+  if (typeof userSystem === "string" && userSystem.trim().length > 0) {
+    extraBlocks.push({ type: "text", text: userSystem });
+  }
+  anthropicBody.system = [
+    { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+    { type: "text", text: "You are running in conversational chat mode inside claude-lens, a local OpenAI-compatible API gateway. The user is making API calls — respond as a general-purpose assistant. You have no file access, no tool use, and no workspace in this session." },
+    ...extraBlocks,
+  ];
+
+  const wantStream = !!anthropicBody.stream;
+  const includeUsage = !!(req.body && req.body.stream_options && req.body.stream_options.include_usage);
+
+  let upstreamRes;
+  try {
+    upstreamRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-lens/1.0",
+      },
+      body: JSON.stringify(anthropicBody),
+    });
+  } catch (err) {
+    return res.status(502).json({ error: { type: "upstream_error", message: err.message } });
+  }
+
+  // Forward Anthropic rate-limit + warning headers
+  for (const [name, value] of upstreamRes.headers) {
+    const n = name.toLowerCase();
+    if (n.startsWith("anthropic-ratelimit-") || n === "retry-after" || n === "anthropic-request-id") {
+      res.setHeader(name, value);
+    }
+  }
+  if (warnings.length > 0) res.setHeader("X-Claude-Lens-Warnings", warnings.join("; "));
+
+  if (!upstreamRes.ok) {
+    // Upstream returned a non-2xx — translate the error envelope to OpenAI shape.
+    const errText = await upstreamRes.text().catch(() => "");
+    let parsed = null;
+    try { parsed = JSON.parse(errText); } catch { /* ignore */ }
+    const errType = parsed?.error?.type || "upstream_error";
+    const errMsg = parsed?.error?.message || errText || `HTTP ${upstreamRes.status}`;
+    return res.status(upstreamRes.status).json({
+      error: {
+        type: errType === "rate_limit_error" ? "rate_limit_exceeded" : errType,
+        message: errMsg,
+        code: errType,
+      },
+    });
+  }
+
+  if (wantStream) {
+    res.status(200);
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("X-Accel-Buffering", "no");
+    if (!upstreamRes.body) return res.end();
+    const reader = upstreamRes.body.getReader();
+    req.on("close", () => {
+      try { reader.cancel("client_disconnected"); } catch { /* ignore */ }
+    });
+    await pipeAnthropicStreamAsOpenAI(reader, res, anthropicBody.model, includeUsage);
+    return;
+  }
+
+  // Non-streaming
+  let anth;
+  try {
+    anth = await upstreamRes.json();
+  } catch (err) {
+    return res.status(502).json({ error: { type: "upstream_error", message: "Upstream returned non-JSON: " + err.message } });
+  }
+  res.json(anthropicResponseToOpenAI(anth, anthropicBody.model));
+});
+
+// GET /api — serve the OpenAI-compatible API docs / playground page
+app.get("/api", (req, res) => {
+  res.sendFile(path.join(__dirname, "api.html"));
+});
+
 // GET /api/stats — return stats-cache.json as-is
 app.get("/api/stats", (req, res) => {
   try {
@@ -262,6 +1254,7 @@ app.get("/api/tool-calls", async (req, res) => {
     const projectsDir = path.join(CLAUDE_DIR, "projects");
     const toolCounts = {};
     const toolsByProject = {};
+    const toolsByDate = {};
 
     const projectDirs = fs
       .readdirSync(projectsDir)
@@ -272,7 +1265,7 @@ app.get("/api/tool-calls", async (req, res) => {
       const jsonlFiles = findJsonlFiles(projPath);
 
       for (const file of jsonlFiles) {
-        await parseJsonlForTools(file, projDir, toolCounts, toolsByProject);
+        await parseJsonlForTools(file, projDir, toolCounts, toolsByProject, toolsByDate);
       }
     }
 
@@ -281,7 +1274,7 @@ app.get("/api/tool-calls", async (req, res) => {
       .sort((a, b) => b[1] - a[1])
       .map(([tool, count]) => ({ tool, count }));
 
-    res.json({ tools: sorted, byProject: toolsByProject });
+    res.json({ tools: sorted, byProject: toolsByProject, byDate: toolsByDate });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -458,7 +1451,7 @@ function findJsonlFiles(dir) {
 }
 
 // Parse a JSONL file and extract tool_use entries
-function parseJsonlForTools(filePath, projDir, toolCounts, toolsByProject) {
+function parseJsonlForTools(filePath, projDir, toolCounts, toolsByProject, toolsByDate) {
   return new Promise((resolve) => {
     const stream = fs.createReadStream(filePath, { encoding: "utf8" });
     const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
@@ -469,6 +1462,7 @@ function parseJsonlForTools(filePath, projDir, toolCounts, toolsByProject) {
         if (obj.type !== "assistant" || !obj.message) return;
         const content = obj.message.content;
         if (!Array.isArray(content)) return;
+        const day = obj.timestamp ? localDateKey(obj.timestamp) : null;
 
         for (const item of content) {
           if (item.type === "tool_use") {
@@ -478,6 +1472,11 @@ function parseJsonlForTools(filePath, projDir, toolCounts, toolsByProject) {
             if (!toolsByProject[projDir]) toolsByProject[projDir] = {};
             toolsByProject[projDir][tool] =
               (toolsByProject[projDir][tool] || 0) + 1;
+
+            if (toolsByDate && day) {
+              if (!toolsByDate[day]) toolsByDate[day] = {};
+              toolsByDate[day][tool] = (toolsByDate[day][tool] || 0) + 1;
+            }
           }
         }
       } catch {
@@ -653,6 +1652,22 @@ function parseJsonlForToolDetails(filePath, projDir, toolName, calls) {
     rl.on("error", resolve);
   });
 }
+
+// JSON-shaped error responses for /api/* and /v1/* routes. Without this,
+// body-parser failures on malformed JSON return Express's default HTML
+// stack-trace page, which the dashboard's `.json().catch()` can't parse
+// into a useful message. Catches everything that lands here as a fallback.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  const wantsJson = req.path && (req.path.startsWith("/api/") || req.path.startsWith("/v1/"));
+  if (!wantsJson) return next(err);
+  const status = Number.isInteger(err?.status) ? err.status : 500;
+  const type = err?.type ?? (status >= 500 ? "server_error" : "invalid_request_error");
+  res.status(status).json({
+    error: type,
+    message: err?.message ?? "Unknown server error",
+  });
+});
 
 app.listen(PORT, () => {
   console.log(`Claude Usage Dashboard running at http://localhost:${PORT}`);
