@@ -100,6 +100,8 @@
       color: var(--accent);
       border-color: var(--border);
     }
+    .nav a:active { background: var(--bg-sunken); }
+    .nav a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .nav a.active {
       color: var(--accent-on);
       background: var(--accent-strong);
@@ -1178,6 +1180,7 @@
       <h1>Claude Code Usage Dashboard</h1>
       <nav class="nav" aria-label="Primary">
         <a href="/" class="active">Dashboard</a>
+        <a href="/sessions">Sessions</a>
         <a href="/account">Account</a>
         <a href="/chat">Chat</a>
         <a href="/api">API</a>

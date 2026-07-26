@@ -10,6 +10,7 @@ A local dashboard for visualizing your [Claude Code](https://claude.ai/code) usa
 - **Cache performance** — hit rate, savings vs no-cache baseline
 - **Daily cost & cache table** — per-day token breakdown with estimated spend
 - **Tool call analytics** — which tools Claude used most, across all projects
+- **Session history browser** — a dedicated `/sessions` page for reading back any past conversation in full. Browse every session across every project (searchable by title, prompt, path, or session id; filterable by project and date; sortable by recency, cost, message count, tool calls, or duration), then open one to get the complete transcript: your prompts, Claude's replies, thinking blocks, every tool call with its arguments, every tool result, and **colour-coded diffs** for each `Edit` / `Write`. Per-message model, token counts, cost, stop reason, and skill/MCP attribution are shown inline. Sub-agent (`Task`) sidechains are listed separately and open as their own transcripts. Toggle chips hide or show prompts / replies / thinking / tools / system events / attachments, there's a find-in-transcript box, and any truncated block or raw JSONL entry can be expanded on demand.
 - **Auto-detected data directory** — finds your Claude Code data folder on Windows, macOS, and Linux without configuration; falls back gracefully and tells you which paths it tried if nothing is found
 - **Chat page** — a streaming chat UI at `/chat` that talks to your account models (Opus 4.7, Sonnet 4.6, Haiku 4.5) using your local OAuth token. No API key required — inference is billed against your existing Claude account quota. Multi-conversation history with a browser, multimodal uploads (images / PDFs / text via paperclip, drag-drop, or paste), and an advanced settings drawer for `max_tokens`, `temperature`, `top_p`, history budget, and a custom system addendum. The token stays server-side; the browser only sees the proxied response stream.
 - **OpenAI-compatible API** — local `POST /v1/chat/completions` and `GET /v1/models` endpoints at `http://localhost:3456/v1`. Lets the official `openai` Python / Node SDKs (and any other client that speaks OpenAI's wire format) call your local Claude account by just changing `base_url`. Streaming, system messages, and multimodal `image_url` blocks (data URLs and remote URLs) are translated automatically. The dedicated [/api page](http://localhost:3456/api) bundles a request playground, a **Stress test** panel for concurrent load testing (configurable concurrency / total / max-tokens, live percentile latency, per-request log, and the latest Anthropic rate-limit headers), copy-pasteable cURL / Python / Node snippets, and a full reference of which OpenAI fields are supported.
@@ -158,6 +159,30 @@ If `CLAUDE_DIR` isn't set (or points somewhere invalid), claude-lens tries these
 4. **Linux:** `$XDG_CONFIG_HOME/claude` (or `~/.config/claude`)
 
 A directory is considered valid if it contains any of: `projects/`, `history.jsonl`, `sessions/`, or `stats-cache.json`. The active path and its source are shown in the dashboard header. If nothing valid is found, the dashboard shows an error banner listing every path that was tried — set `CLAUDE_DIR` in `.env` to point at the right one.
+
+### Browsing session history
+
+The [/sessions](http://localhost:3456/sessions) page reads your transcripts straight out of `CLAUDE_DIR/projects/**/*.jsonl` and reconstructs each conversation.
+
+**Left pane — the session list.** One row per session with its AI-generated title (or first prompt), project path, relative start time, duration, prompt/tool counts, estimated cost, models used, and badges for sub-agents, API errors, and compactions. Search matches titles, first/last prompts, working directories, and session ids. Results paginate 50 at a time.
+
+**Right pane — the transcript.** Header metrics (duration, prompts, replies, tool calls, thinking blocks, token split, cost, transcript size) plus chips for models, git branches, CLI versions, entrypoints, and any linked PRs. Below that, the timeline:
+
+| Entry | Rendered as |
+|-------|-------------|
+| Your prompts | Plain text, accent-bordered |
+| Claude's replies | Text, with model / token / cost / stop-reason in the header |
+| Thinking | Collapsed by default, expandable |
+| Tool calls | Collapsed, showing tool name + a one-line argument preview; expands to the full JSON input |
+| Tool results | Collapsed, with error styling when the call failed |
+| `Edit` / `Write` | A colour-coded unified diff, reconstructed from the recorded `structuredPatch` |
+| `Bash` | Captured stdout / stderr |
+| Sub-agent launches | A button that opens that sub-agent's own transcript |
+| API errors, compaction boundaries, mode changes | Inline banners and dividers |
+
+Long blocks are truncated to 2 000 characters for transfer; **Load full block** refetches just that one entry uncapped. The `{ }` button on any message shows its raw JSONL record. Deep links work — `/sessions#<sessionId>` opens a specific session.
+
+Nothing here costs anything: the page reads local files only and makes no inference calls.
 
 ### Theme
 
