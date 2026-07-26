@@ -1795,6 +1795,45 @@ function parseJsonlForTools(filePath, projDir, toolCounts, toolsByProject, tools
 // Multimodal turns (text + image) arrive as a content-block array — pull
 // the text blocks out and join them. Pure tool-result arrays have no text
 // blocks, so they fall out naturally below.
+// Claude Code writes several kinds of synthetic "user" turns into the
+// transcript — slash-command echoes, local command stdout/stderr, hook
+// output, interrupt notices. None of them were typed by the human, so every
+// prompt-facing view has to filter them out identically.
+const SYNTHETIC_PROMPT_PREFIXES = [
+  "<command-name>",
+  "<command-message>",
+  "<command-args>",
+  "<local-command-stdout>",
+  "<local-command-stderr>",
+  "<bash-input>",
+  "<bash-stdout>",
+  "<bash-stderr>",
+  "Caveat:",
+  "[Request interrupted",
+];
+
+// Returns the human-typed text of a user turn, or null if this turn was
+// synthetic / empty / not text at all. `raw` is `message.content` — either a
+// plain string or a content-block array (multimodal turns). Pure tool-result
+// arrays carry no text blocks and so fall out as null.
+function cleanUserPromptText(raw) {
+  let content;
+  if (typeof raw === "string") {
+    content = raw;
+  } else if (Array.isArray(raw)) {
+    content = raw
+      .filter((b) => b && b.type === "text" && typeof b.text === "string")
+      .map((b) => b.text)
+      .join("\n");
+  } else {
+    return null;
+  }
+  const trimmed = content.trim();
+  if (!trimmed) return null;
+  if (SYNTHETIC_PROMPT_PREFIXES.some((p) => trimmed.startsWith(p))) return null;
+  return trimmed;
+}
+
 function parsePromptsFromProject(filePath, entries) {
   return new Promise((resolve) => {
     const stream = fs.createReadStream(filePath, { encoding: "utf8" });
@@ -1804,34 +1843,8 @@ function parsePromptsFromProject(filePath, entries) {
       try {
         const obj = JSON.parse(line);
         if (obj.type !== "user" || !obj.message) return;
-        const raw = obj.message.content;
-        let content;
-        if (typeof raw === "string") {
-          content = raw;
-        } else if (Array.isArray(raw)) {
-          content = raw
-            .filter((b) => b && b.type === "text" && typeof b.text === "string")
-            .map((b) => b.text)
-            .join("\n")
-            .trim();
-          if (!content) return;
-        } else {
-          return;
-        }
-        const trimmed = content.trim();
+        const trimmed = cleanUserPromptText(obj.message.content);
         if (!trimmed) return;
-        if (
-          trimmed.startsWith("<command-name>") ||
-          trimmed.startsWith("<command-message>") ||
-          trimmed.startsWith("<command-args>") ||
-          trimmed.startsWith("<local-command-stdout>") ||
-          trimmed.startsWith("<local-command-stderr>") ||
-          trimmed.startsWith("<bash-input>") ||
-          trimmed.startsWith("<bash-stdout>") ||
-          trimmed.startsWith("<bash-stderr>") ||
-          trimmed.startsWith("Caveat:") ||
-          trimmed.startsWith("[Request interrupted")
-        ) return;
 
         const display = trimmed.length > 500 ? trimmed.slice(0, 500) + "…" : trimmed;
         entries.push({
@@ -1967,6 +1980,813 @@ function parseJsonlForToolDetails(filePath, projDir, toolName, calls) {
     rl.on("error", resolve);
   });
 }
+
+// ===========================================================================
+// === Session history browser ===
+//
+// A browsable, drill-down view over every transcript in projects/**/*.jsonl:
+// an index endpoint (one row per session) and a full normalized transcript
+// endpoint for a single session.
+//
+// Layout on disk, established by inspecting real data:
+//   projects/<encoded-cwd>/<sessionId>.jsonl              — main transcript
+//   projects/<encoded-cwd>/<sessionId>/subagents/agent-<agentId>.jsonl
+//                                                         — subagent sidechain
+// Subagent files carry the *parent's* sessionId, so grouping by sessionId
+// alone would silently merge a Task's inner turns into the main timeline.
+// They're split out into `subagents[]` instead and fetched on demand.
+//
+// Building the index from cold parses every transcript (~260 MB on a heavy
+// user's machine, ~1 s). Per-file summaries are memoised by (mtimeMs, size),
+// so every rebuild after the first only re-reads files Claude Code appended
+// to — a warm rebuild is one statSync per file.
+// ===========================================================================
+
+// Ids are resolved through the in-memory index, which only ever holds paths
+// this process walked itself — a path is never built by concatenating a
+// request value. This shape check is belt-and-braces on top of that.
+const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+const SESSION_LIST_LIMIT_DEFAULT = 50;
+const SESSION_LIST_LIMIT_MAX = 500;
+const SESSION_BLOCK_CAP = 2000; // chars kept per text / thinking / tool block
+const SESSION_PATCH_HUNK_CAP = 40; // structuredPatch hunks kept per edit
+const SESSION_FILENAMES_CAP = 50;
+
+const sessionFileCache = new Map(); // absPath -> { mtimeMs, size, summary }
+let sessionIndexInFlight = null;
+
+function isSubagentTranscript(filePath) {
+  return (
+    path.basename(filePath).startsWith("agent-") ||
+    path.basename(path.dirname(filePath)) === "subagents"
+  );
+}
+
+function newTokenBag() {
+  return { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 };
+}
+
+function addTokens(into, from) {
+  into.input += from.input;
+  into.output += from.output;
+  into.cacheRead += from.cacheRead;
+  into.cacheCreate += from.cacheCreate;
+}
+
+function costOfTokens(t) {
+  return (
+    t.input * RATES.input +
+    t.output * RATES.output +
+    t.cacheRead * RATES.cacheRead +
+    t.cacheCreate * RATES.cacheCreate
+  );
+}
+
+function bumpCount(map, key) {
+  if (!key) return;
+  map[key] = (map[key] || 0) + 1;
+}
+
+// Summarise one transcript file into an index row. Streams line-by-line and
+// swallows malformed lines, matching the other parsers in this file.
+function summarizeSessionFile(filePath, projDir) {
+  return new Promise((resolve) => {
+    const s = {
+      sessionId: null,
+      project: projDir,
+      cwd: null,
+      isSubagent: isSubagentTranscript(filePath),
+      agentId: null,
+      title: null,
+      firstPrompt: null,
+      lastPrompt: null,
+      startedAt: null,
+      endedAt: null,
+      userMessages: 0,
+      assistantMessages: 0,
+      toolCalls: 0,
+      thinkingBlocks: 0,
+      images: 0,
+      errors: 0,
+      compactions: 0,
+      entries: 0,
+      tokens: newTokenBag(),
+      models: {},
+      tools: {},
+      gitBranches: [],
+      versions: [],
+      entrypoints: [],
+      prLinks: [],
+    };
+    const branches = new Set();
+    const versions = new Set();
+    const entrypoints = new Set();
+
+    const stream = fs.createReadStream(filePath, { encoding: "utf8" });
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+
+    rl.on("line", (line) => {
+      if (!line.trim()) return;
+      try {
+        const obj = JSON.parse(line);
+        s.entries++;
+        if (!s.sessionId && obj.sessionId) s.sessionId = obj.sessionId;
+        if (!s.agentId && obj.agentId) s.agentId = obj.agentId;
+        if (!s.cwd && obj.cwd) s.cwd = obj.cwd;
+        if (obj.gitBranch) branches.add(obj.gitBranch);
+        if (obj.version) versions.add(obj.version);
+        if (obj.entrypoint) entrypoints.add(obj.entrypoint);
+
+        const ts = obj.timestamp;
+        if (ts) {
+          if (!s.startedAt || ts < s.startedAt) s.startedAt = ts;
+          if (!s.endedAt || ts > s.endedAt) s.endedAt = ts;
+        }
+
+        switch (obj.type) {
+          case "ai-title":
+            if (obj.aiTitle) s.title = obj.aiTitle;
+            break;
+          case "pr-link":
+            if (obj.prUrl) {
+              s.prLinks.push({
+                url: obj.prUrl,
+                number: obj.prNumber ?? null,
+                repository: obj.prRepository ?? null,
+              });
+            }
+            break;
+          case "system":
+            if (obj.subtype === "api_error") s.errors++;
+            if (obj.subtype === "compact_boundary") s.compactions++;
+            break;
+          case "user": {
+            const content = obj.message?.content;
+            const isToolResult =
+              Array.isArray(content) &&
+              content.some((b) => b?.type === "tool_result");
+            if (Array.isArray(content)) {
+              for (const b of content) {
+                if (b?.type === "image") s.images++;
+              }
+            }
+            if (isToolResult) break;
+            const prompt = cleanUserPromptText(content);
+            if (prompt) {
+              s.userMessages++;
+              if (!s.firstPrompt) s.firstPrompt = prompt.slice(0, 400);
+              s.lastPrompt = prompt.slice(0, 400);
+            }
+            break;
+          }
+          case "assistant": {
+            const msg = obj.message;
+            if (!msg) break;
+            s.assistantMessages++;
+            bumpCount(s.models, msg.model || "unknown");
+            const u = msg.usage || {};
+            s.tokens.input += u.input_tokens || 0;
+            s.tokens.output += u.output_tokens || 0;
+            s.tokens.cacheRead += u.cache_read_input_tokens || 0;
+            s.tokens.cacheCreate += u.cache_creation_input_tokens || 0;
+            if (Array.isArray(msg.content)) {
+              for (const b of msg.content) {
+                if (!b) continue;
+                if (b.type === "tool_use") {
+                  s.toolCalls++;
+                  bumpCount(s.tools, b.name);
+                } else if (b.type === "thinking") {
+                  s.thinkingBlocks++;
+                }
+              }
+            }
+            break;
+          }
+          default:
+            break;
+        }
+      } catch {
+        // skip malformed lines
+      }
+    });
+
+    const finish = () => {
+      s.gitBranches = [...branches];
+      s.versions = [...versions];
+      s.entrypoints = [...entrypoints];
+      resolve(s);
+    };
+    rl.on("close", finish);
+    rl.on("error", finish);
+  });
+}
+
+// Walk projects/, refresh any changed file summaries, then group by sessionId.
+function buildSessionIndexUncached() {
+  const projectsDir = path.join(CLAUDE_DIR, "projects");
+  let projectDirs = [];
+  try {
+    projectDirs = fs
+      .readdirSync(projectsDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name);
+  } catch {
+    projectDirs = [];
+  }
+
+  const found = [];
+  for (const projDir of projectDirs) {
+    try {
+      for (const file of findJsonlFiles(path.join(projectsDir, projDir))) {
+        found.push({ file, projDir });
+      }
+    } catch {
+      // unreadable project dir — skip it rather than failing the whole index
+    }
+  }
+
+  return (async () => {
+    const livePaths = new Set();
+    for (const { file, projDir } of found) {
+      livePaths.add(file);
+      let st;
+      try {
+        st = fs.statSync(file);
+      } catch {
+        continue;
+      }
+      const cached = sessionFileCache.get(file);
+      if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+        continue;
+      }
+      const summary = await summarizeSessionFile(file, projDir);
+      summary.sizeBytes = st.size;
+      sessionFileCache.set(file, {
+        mtimeMs: st.mtimeMs,
+        size: st.size,
+        summary,
+      });
+    }
+    for (const key of [...sessionFileCache.keys()]) {
+      if (!livePaths.has(key)) sessionFileCache.delete(key);
+    }
+
+    const sessions = new Map();
+    const getSession = (id) => {
+      let sess = sessions.get(id);
+      if (!sess) {
+        sess = {
+          sessionId: id,
+          project: null,
+          cwd: null,
+          title: null,
+          firstPrompt: null,
+          lastPrompt: null,
+          startedAt: null,
+          endedAt: null,
+          durationMs: null,
+          userMessages: 0,
+          assistantMessages: 0,
+          toolCalls: 0,
+          thinkingBlocks: 0,
+          images: 0,
+          errors: 0,
+          compactions: 0,
+          entries: 0,
+          tokens: newTokenBag(),
+          cost: 0,
+          models: {},
+          tools: {},
+          gitBranches: [],
+          versions: [],
+          entrypoints: [],
+          prLinks: [],
+          sizeBytes: 0,
+          subagents: [],
+          hasMain: false,
+          _mainPath: null,
+        };
+        sessions.set(id, sess);
+      }
+      return sess;
+    };
+
+    for (const [filePath, { summary }] of sessionFileCache) {
+      const id = summary.sessionId;
+      if (!id) continue;
+      const sess = getSession(id);
+
+      // Roll every file's counters into the session totals — subagent turns
+      // are real billed traffic, so they belong in the headline numbers.
+      sess.userMessages += summary.userMessages;
+      sess.assistantMessages += summary.assistantMessages;
+      sess.toolCalls += summary.toolCalls;
+      sess.thinkingBlocks += summary.thinkingBlocks;
+      sess.images += summary.images;
+      sess.errors += summary.errors;
+      sess.compactions += summary.compactions;
+      sess.entries += summary.entries;
+      sess.sizeBytes += summary.sizeBytes || 0;
+      addTokens(sess.tokens, summary.tokens);
+      for (const [m, c] of Object.entries(summary.models)) {
+        sess.models[m] = (sess.models[m] || 0) + c;
+      }
+      for (const [t, c] of Object.entries(summary.tools)) {
+        sess.tools[t] = (sess.tools[t] || 0) + c;
+      }
+      if (summary.startedAt && (!sess.startedAt || summary.startedAt < sess.startedAt)) {
+        sess.startedAt = summary.startedAt;
+      }
+      if (summary.endedAt && (!sess.endedAt || summary.endedAt > sess.endedAt)) {
+        sess.endedAt = summary.endedAt;
+      }
+
+      if (summary.isSubagent) {
+        sess.subagents.push({
+          agentId: summary.agentId || path.basename(filePath, ".jsonl"),
+          description: summary.firstPrompt,
+          startedAt: summary.startedAt,
+          endedAt: summary.endedAt,
+          userMessages: summary.userMessages,
+          assistantMessages: summary.assistantMessages,
+          toolCalls: summary.toolCalls,
+          thinkingBlocks: summary.thinkingBlocks,
+          errors: summary.errors,
+          tokens: summary.tokens,
+          cost: costOfTokens(summary.tokens),
+          models: summary.models,
+          sizeBytes: summary.sizeBytes || 0,
+          _path: filePath,
+        });
+      } else {
+        sess.hasMain = true;
+        sess._mainPath = filePath;
+        sess.project = summary.project;
+        sess.cwd = summary.cwd;
+        if (summary.title) sess.title = summary.title;
+        sess.firstPrompt = summary.firstPrompt;
+        sess.lastPrompt = summary.lastPrompt;
+        sess.prLinks = summary.prLinks;
+        sess.gitBranches = summary.gitBranches;
+        sess.versions = summary.versions;
+        sess.entrypoints = summary.entrypoints;
+      }
+    }
+
+    for (const sess of sessions.values()) {
+      // Orphan sidechains (main transcript deleted) still deserve a row —
+      // backfill their identity from the subagent files we do have.
+      if (!sess.project) {
+        const first = sessionFileCache.get(sess.subagents[0]?._path);
+        if (first) {
+          sess.project = first.summary.project;
+          sess.cwd = first.summary.cwd;
+        }
+      }
+      sess.subagents.sort((a, b) => (a.startedAt || "").localeCompare(b.startedAt || ""));
+      sess.subagentCount = sess.subagents.length;
+      sess.cost = costOfTokens(sess.tokens);
+      sess.durationMs =
+        sess.startedAt && sess.endedAt
+          ? Math.max(0, Date.parse(sess.endedAt) - Date.parse(sess.startedAt))
+          : null;
+    }
+
+    return sessions;
+  })();
+}
+
+// Single-flight wrapper: concurrent page loads share one rebuild instead of
+// each kicking off a full parse of the transcript tree.
+function getSessionIndex() {
+  if (!sessionIndexInFlight) {
+    sessionIndexInFlight = buildSessionIndexUncached().finally(() => {
+      sessionIndexInFlight = null;
+    });
+  }
+  return sessionIndexInFlight;
+}
+
+// Strip the internal `_path` handles before anything crosses the wire —
+// absolute filesystem paths aren't the browser's business.
+function publicSession(sess) {
+  const { _mainPath, subagents, ...rest } = sess;
+  return {
+    ...rest,
+    subagents: subagents.map(({ _path, ...s }) => s),
+  };
+}
+
+function cappedText(value, cap) {
+  const s =
+    typeof value === "string"
+      ? value
+      : value == null
+        ? ""
+        : JSON.stringify(value, null, 2);
+  if (!Number.isFinite(cap) || s.length <= cap) {
+    return { text: s, length: s.length };
+  }
+  return { text: s.slice(0, cap), length: s.length, truncated: true };
+}
+
+// tool_result content is a string for most tools, a block array for others
+// (images, tool references). Flatten to displayable text either way.
+function toolResultToText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return content == null ? "" : JSON.stringify(content, null, 2);
+  return content
+    .map((b) => {
+      if (!b || typeof b !== "object") return String(b ?? "");
+      if (b.type === "text") return b.text || "";
+      if (b.type === "image") return `[image: ${b.source?.media_type || "unknown"}]`;
+      if (b.type === "tool_reference") return `[tool reference: ${b.tool_name || "?"}]`;
+      return `[${b.type || "block"}]`;
+    })
+    .join("\n");
+}
+
+function normalizeBlock(b, cap) {
+  if (!b || typeof b !== "object") return null;
+  switch (b.type) {
+    case "text":
+      return { type: "text", ...cappedText(b.text, cap) };
+    case "thinking":
+      return { type: "thinking", ...cappedText(b.thinking, cap) };
+    case "tool_use":
+      return {
+        type: "tool_use",
+        id: b.id ?? null,
+        name: b.name ?? null,
+        ...cappedText(b.input, cap),
+      };
+    case "tool_result":
+      return {
+        type: "tool_result",
+        toolUseId: b.tool_use_id ?? null,
+        isError: !!b.is_error,
+        ...cappedText(toolResultToText(b.content), cap),
+      };
+    case "image":
+      return {
+        type: "image",
+        mediaType: b.source?.media_type ?? null,
+        // Byte count only — base64 payloads stay on the server.
+        approxBytes: typeof b.source?.data === "string"
+          ? Math.floor((b.source.data.length * 3) / 4)
+          : null,
+      };
+    default:
+      return { type: b.type || "unknown", ...cappedText(b, cap) };
+  }
+}
+
+// Explicit projection of `toolUseResult` — the rich per-tool metadata Claude
+// Code stores alongside a tool_result (diffs, file lists, exit output). Copy
+// only the fields we render; never spread the raw object.
+function projectToolUseResult(tr, cap) {
+  if (tr == null) return null;
+  if (typeof tr === "string") return { kind: "text", ...cappedText(tr, cap) };
+  if (Array.isArray(tr)) return { kind: "list", count: tr.length, ...cappedText(tr, cap) };
+  if (typeof tr !== "object") return null;
+
+  const out = {};
+  const copyIf = (key, val) => {
+    if (val !== undefined && val !== null) out[key] = val;
+  };
+  copyIf("kind", tr.type);
+  copyIf("filePath", tr.filePath ?? tr.file?.filePath);
+  copyIf("numFiles", tr.numFiles);
+  copyIf("numLines", tr.numLines ?? tr.file?.numLines);
+  copyIf("totalFiles", tr.totalFiles);
+  copyIf("totalMatches", tr.totalMatches);
+  copyIf("durationMs", tr.durationMs);
+  copyIf("truncated", tr.truncated);
+  copyIf("interrupted", tr.interrupted);
+  copyIf("userModified", tr.userModified);
+  copyIf("replaceAll", tr.replaceAll);
+  copyIf("mode", tr.mode);
+  copyIf("agentId", tr.agentId);
+  copyIf("status", tr.status);
+  copyIf("resolvedModel", tr.resolvedModel);
+  copyIf("description", tr.description);
+  copyIf("isImage", tr.isImage);
+
+  if (typeof tr.stdout === "string" && tr.stdout) {
+    out.stdout = cappedText(tr.stdout, cap);
+  }
+  if (typeof tr.stderr === "string" && tr.stderr) {
+    out.stderr = cappedText(tr.stderr, cap);
+  }
+  if (Array.isArray(tr.filenames)) {
+    out.filenames = tr.filenames.slice(0, SESSION_FILENAMES_CAP);
+    if (tr.filenames.length > SESSION_FILENAMES_CAP) {
+      out.filenamesTruncated = tr.filenames.length;
+    }
+  }
+  // structuredPatch is what makes an Edit reviewable after the fact — keep it
+  // in unified-hunk shape so the UI can colour the diff.
+  if (Array.isArray(tr.structuredPatch) && tr.structuredPatch.length) {
+    out.patch = tr.structuredPatch.slice(0, SESSION_PATCH_HUNK_CAP).map((h) => ({
+      oldStart: h.oldStart,
+      oldLines: h.oldLines,
+      newStart: h.newStart,
+      newLines: h.newLines,
+      lines: Array.isArray(h.lines) ? h.lines : [],
+    }));
+    if (tr.structuredPatch.length > SESSION_PATCH_HUNK_CAP) {
+      out.patchTruncated = tr.structuredPatch.length;
+    }
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+// Summarise an `attachment` entry. These are bulk context injections (tool
+// listings, skill listings, directory snapshots) — high volume, low signal,
+// so the index keeps a one-line descriptor and the UI hides them by default.
+function summarizeAttachment(att, cap) {
+  if (!att || typeof att !== "object") return null;
+  const out = { attachmentType: att.type || "unknown" };
+  if (Array.isArray(att.addedNames)) {
+    out.detail = `${att.addedNames.length} tool(s): ${att.addedNames.slice(0, 12).join(", ")}`;
+  } else if (typeof att.content === "string") {
+    out.detail = cappedText(att.content, cap).text;
+  } else if (att.file?.filePath) {
+    out.detail = att.file.filePath;
+  }
+  return out;
+}
+
+function normalizeTranscriptEntry(obj, cap, includeRaw) {
+  const out = {
+    uuid: obj.uuid ?? null,
+    parentUuid: obj.parentUuid ?? null,
+    type: obj.type ?? "unknown",
+    timestamp: obj.timestamp ?? null,
+    isSidechain: !!obj.isSidechain,
+  };
+  if (obj.logicalParentUuid) out.logicalParentUuid = obj.logicalParentUuid;
+  if (obj.agentId) out.agentId = obj.agentId;
+  if (obj.gitBranch) out.gitBranch = obj.gitBranch;
+  if (obj.version) out.version = obj.version;
+  if (obj.cwd) out.cwd = obj.cwd;
+  if (obj.isMeta) out.isMeta = true;
+
+  if (obj.type === "user") {
+    const content = obj.message?.content;
+    out.role = "user";
+    out.blocks = Array.isArray(content)
+      ? content.map((b) => normalizeBlock(b, cap)).filter(Boolean)
+      : typeof content === "string"
+        ? [{ type: "text", ...cappedText(content, cap) }]
+        : [];
+    out.isToolResult = out.blocks.some((b) => b.type === "tool_result");
+    if (!out.isToolResult) {
+      // Flag Claude Code's synthetic turns so the UI can style them apart
+      // from things the human actually typed.
+      out.isSynthetic = cleanUserPromptText(content) === null;
+    }
+    if (obj.permissionMode) out.permissionMode = obj.permissionMode;
+    if (obj.promptSource) out.promptSource = obj.promptSource;
+    if (obj.origin?.kind) out.originKind = obj.origin.kind;
+    const trMeta = projectToolUseResult(obj.toolUseResult, cap);
+    if (trMeta) out.toolResultMeta = trMeta;
+  } else if (obj.type === "assistant") {
+    const msg = obj.message || {};
+    out.role = "assistant";
+    out.model = msg.model ?? null;
+    out.stopReason = msg.stop_reason ?? null;
+    out.requestId = obj.requestId ?? null;
+    if (obj.effort) out.effort = obj.effort;
+    if (obj.attributionSkill) out.attributionSkill = obj.attributionSkill;
+    if (obj.attributionMcpServer) out.attributionMcpServer = obj.attributionMcpServer;
+    if (obj.attributionMcpTool) out.attributionMcpTool = obj.attributionMcpTool;
+    const u = msg.usage || {};
+    const tokens = {
+      input: u.input_tokens || 0,
+      output: u.output_tokens || 0,
+      cacheRead: u.cache_read_input_tokens || 0,
+      cacheCreate: u.cache_creation_input_tokens || 0,
+    };
+    out.tokens = tokens;
+    out.cost = costOfTokens(tokens);
+    if (u.service_tier) out.serviceTier = u.service_tier;
+    out.blocks = Array.isArray(msg.content)
+      ? msg.content.map((b) => normalizeBlock(b, cap)).filter(Boolean)
+      : typeof msg.content === "string"
+        ? [{ type: "text", ...cappedText(msg.content, cap) }]
+        : [];
+  } else if (obj.type === "system") {
+    out.subtype = obj.subtype ?? null;
+    out.level = obj.level ?? null;
+    if (obj.content) out.content = cappedText(obj.content, cap);
+    if (obj.error) {
+      out.error = {
+        message: cappedText(obj.error.message, cap).text,
+        status: obj.error.status ?? null,
+        requestId: obj.error.requestId ?? null,
+      };
+    }
+    if (obj.compactMetadata) {
+      out.compactMetadata = {
+        trigger: obj.compactMetadata.trigger ?? null,
+        preTokens: obj.compactMetadata.preTokens ?? null,
+      };
+    }
+  } else if (obj.type === "attachment") {
+    const att = summarizeAttachment(obj.attachment, 400);
+    if (att) Object.assign(out, att);
+  } else if (obj.type === "pr-link") {
+    out.prUrl = obj.prUrl ?? null;
+    out.prNumber = obj.prNumber ?? null;
+    out.prRepository = obj.prRepository ?? null;
+  } else if (obj.type === "mode") {
+    out.mode = obj.mode ?? null;
+  }
+
+  if (includeRaw) out.raw = obj;
+  return out;
+}
+
+// Read one transcript file into an ordered, normalized timeline.
+// `filterUuid` short-circuits to a single entry — that's how the UI expands a
+// truncated block without refetching a multi-megabyte transcript.
+function readTranscript(filePath, { cap, includeRaw, filterUuid }) {
+  return new Promise((resolve) => {
+    const messages = [];
+    const skipped = { attachments: 0 };
+    const stream = fs.createReadStream(filePath, { encoding: "utf8" });
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+
+    rl.on("line", (line) => {
+      if (!line.trim()) return;
+      try {
+        const obj = JSON.parse(line);
+        // Bookkeeping records with no place on a timeline.
+        if (
+          obj.type === "queue-operation" ||
+          obj.type === "file-history-snapshot" ||
+          obj.type === "file-history-delta" ||
+          obj.type === "ai-title" ||
+          obj.type === "last-prompt"
+        ) {
+          return;
+        }
+        if (filterUuid && obj.uuid !== filterUuid) return;
+        messages.push(normalizeTranscriptEntry(obj, cap, includeRaw));
+      } catch {
+        // skip malformed lines
+      }
+    });
+
+    const finish = () => resolve({ messages, skipped });
+    rl.on("close", finish);
+    rl.on("error", finish);
+  });
+}
+
+// GET /api/session-history — index of every session, newest first.
+// Query: q, project, from, to, sort, limit, offset.
+app.get("/api/session-history", async (req, res) => {
+  try {
+    const index = await getSessionIndex();
+    let list = [...index.values()];
+
+    const projects = new Map();
+    for (const s of list) {
+      if (!s.project) continue;
+      const p = projects.get(s.project) || { project: s.project, cwd: s.cwd, count: 0 };
+      p.count++;
+      if (!p.cwd && s.cwd) p.cwd = s.cwd;
+      projects.set(s.project, p);
+    }
+
+    const q = String(req.query.q || "").trim().toLowerCase();
+    if (q) {
+      list = list.filter((s) =>
+        [s.title, s.firstPrompt, s.lastPrompt, s.cwd, s.project, s.sessionId]
+          .filter(Boolean)
+          .some((v) => String(v).toLowerCase().includes(q)),
+      );
+    }
+    if (req.query.project) {
+      list = list.filter((s) => s.project === req.query.project);
+    }
+    const from = req.query.from ? String(req.query.from) : null;
+    const to = req.query.to ? String(req.query.to) : null;
+    if (from || to) {
+      list = list.filter((s) => {
+        if (!s.startedAt) return false;
+        const day = localDateKey(s.startedAt);
+        if (!day) return false;
+        if (from && day < from) return false;
+        if (to && day > to) return false;
+        return true;
+      });
+    }
+
+    const sorters = {
+      recent: (a, b) => (b.startedAt || "").localeCompare(a.startedAt || ""),
+      oldest: (a, b) => (a.startedAt || "").localeCompare(b.startedAt || ""),
+      cost: (a, b) => b.cost - a.cost,
+      messages: (a, b) =>
+        b.userMessages + b.assistantMessages - (a.userMessages + a.assistantMessages),
+      tools: (a, b) => b.toolCalls - a.toolCalls,
+      duration: (a, b) => (b.durationMs || 0) - (a.durationMs || 0),
+    };
+    const sortKey = sorters[req.query.sort] ? req.query.sort : "recent";
+    list.sort(sorters[sortKey]);
+
+    const total = list.length;
+    const totals = list.reduce(
+      (acc, s) => {
+        acc.cost += s.cost;
+        acc.userMessages += s.userMessages;
+        acc.assistantMessages += s.assistantMessages;
+        acc.toolCalls += s.toolCalls;
+        addTokens(acc.tokens, s.tokens);
+        return acc;
+      },
+      { cost: 0, userMessages: 0, assistantMessages: 0, toolCalls: 0, tokens: newTokenBag() },
+    );
+
+    const limit = Math.min(
+      SESSION_LIST_LIMIT_MAX,
+      Math.max(1, parseInt(req.query.limit, 10) || SESSION_LIST_LIMIT_DEFAULT),
+    );
+    const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+    const page = list.slice(offset, offset + limit).map(publicSession);
+
+    res.json({
+      sessions: page,
+      total,
+      totals,
+      offset,
+      limit,
+      sort: sortKey,
+      projects: [...projects.values()].sort((a, b) => b.count - a.count),
+      rates: RATES,
+      timezone: getTimezoneInfo(),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/session-history/:id — full normalized transcript for one session.
+// Query: full=1 (no truncation), raw=1 (include the source JSONL entry),
+// uuid=<messageUuid> (single message), agent=<agentId> (subagent sidechain).
+app.get("/api/session-history/:id", async (req, res) => {
+  try {
+    const id = String(req.params.id || "");
+    if (!SESSION_ID_RE.test(id)) {
+      return res.status(400).json({ error: "Invalid session id" });
+    }
+    const index = await getSessionIndex();
+    const sess = index.get(id);
+    if (!sess) return res.status(404).json({ error: "Session not found" });
+
+    let filePath = sess._mainPath;
+    let agent = null;
+    if (req.query.agent) {
+      const agentId = String(req.query.agent);
+      if (!SESSION_ID_RE.test(agentId)) {
+        return res.status(400).json({ error: "Invalid agent id" });
+      }
+      // Resolve through the index — the path comes from our own walk, never
+      // from the request.
+      agent = sess.subagents.find((s) => s.agentId === agentId);
+      if (!agent) return res.status(404).json({ error: "Subagent not found" });
+      filePath = agent._path;
+    }
+    if (!filePath) {
+      return res.status(404).json({ error: "No transcript file for this session" });
+    }
+
+    const cap = req.query.full === "1" ? Infinity : SESSION_BLOCK_CAP;
+    const includeRaw = req.query.raw === "1";
+    const filterUuid = req.query.uuid ? String(req.query.uuid) : null;
+
+    const { messages } = await readTranscript(filePath, { cap, includeRaw, filterUuid });
+
+    res.json({
+      session: publicSession(sess),
+      agent: agent ? (({ _path, ...rest }) => rest)(agent) : null,
+      messages,
+      messageCount: messages.length,
+      truncatedAt: Number.isFinite(cap) ? cap : null,
+      rates: RATES,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /sessions — serve sessions.html
+app.get("/sessions", (req, res) => {
+  res.sendFile(path.join(__dirname, "sessions.html"));
+});
 
 // JSON-shaped error responses for /api/* and /v1/* routes. Without this,
 // body-parser failures on malformed JSON return Express's default HTML

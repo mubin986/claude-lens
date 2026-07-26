@@ -1,0 +1,1388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Session History — claude-lens</title>
+  <style>
+    /* === Theme tokens (shared with index.html / account.html) === */
+    :root[data-theme="dark"] {
+      --bg: #0d1117;
+      --bg-elevated: #161b22;
+      --bg-sunken: #0d1117;
+      --border: #21262d;
+      --border-strong: #30363d;
+      --text: #c9d1d9;
+      --text-strong: #f0f6fc;
+      --text-muted: #8b949e;
+      --text-faint: #484f58;
+      --accent: #58a6ff;
+      --accent-strong: #388bfd;
+      --accent-on: #ffffff;
+      --green: #7ee787;
+      --amber: #d29922;
+      --pink: #f778ba;
+      --info: #79c0ff;
+      --purple: #d2a8ff;
+      --purple-hover: #e2c5ff;
+      --red: #da3633;
+      --red-strong: #f85149;
+      --badge-bg: #1f2937;
+      --badge-text: #79c0ff;
+      --row-hover: #161b22;
+      --shadow: 0 1px 0 rgba(0,0,0,0.1);
+      --diff-add-bg: rgba(46, 160, 67, 0.15);
+      --diff-del-bg: rgba(248, 81, 73, 0.12);
+    }
+    :root[data-theme="light"] {
+      --bg: #ffffff;
+      --bg-elevated: #f6f8fa;
+      --bg-sunken: #ffffff;
+      --border: #d0d7de;
+      --border-strong: #afb8c1;
+      --text: #1f2328;
+      --text-strong: #1f2328;
+      --text-muted: #656d76;
+      --text-faint: #8c959f;
+      --accent: #0969da;
+      --accent-strong: #0969da;
+      --accent-on: #ffffff;
+      --green: #1a7f37;
+      --amber: #9a6700;
+      --pink: #bf3989;
+      --info: #0969da;
+      --purple: #8250df;
+      --purple-hover: #6639ba;
+      --red: #cf222e;
+      --red-strong: #d1242f;
+      --badge-bg: #ddf4ff;
+      --badge-text: #0969da;
+      --row-hover: #f6f8fa;
+      --shadow: 0 1px 0 rgba(31,35,40,0.04);
+      --diff-add-bg: rgba(46, 160, 67, 0.12);
+      --diff-del-bg: rgba(207, 34, 46, 0.10);
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', Consolas, monospace;
+      background: var(--bg);
+      color: var(--text);
+      padding: 24px;
+      line-height: 1.5;
+      transition: background 0.15s ease, color 0.15s ease;
+    }
+
+    /* === Header === */
+    .header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 20px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 12px;
+    }
+    .header-left { min-width: 0; flex: 1; }
+    h1 { font-size: 1.4rem; color: var(--accent); margin-bottom: 6px; }
+    .nav { display: flex; gap: 4px; margin-top: 4px; flex-wrap: wrap; }
+    .nav a {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      text-decoration: none;
+      padding: 4px 10px;
+      border: 1px solid transparent;
+      border-radius: 6px;
+    }
+    .nav a:hover { color: var(--accent); border-color: var(--border); }
+    .nav a:active { background: var(--bg-sunken); }
+    .nav a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .nav a.active {
+      color: var(--accent-on);
+      background: var(--accent-strong);
+      border-color: var(--accent-strong);
+    }
+    .header-right { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+    .theme-toggle {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 6px 10px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 0.8rem;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .theme-toggle:hover { border-color: var(--accent); color: var(--accent); }
+    .theme-toggle:active { background: var(--bg-sunken); transform: translateY(1px); }
+    .theme-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    .muted { color: var(--text-muted); }
+    .faint { color: var(--text-faint); }
+    .loading { color: var(--text-muted); font-size: 0.82rem; padding: 16px 0; }
+
+    /* === Filter toolbar === */
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 12px;
+    }
+    .toolbar label {
+      font-size: 0.68rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .toolbar input[type="search"],
+    .toolbar input[type="text"],
+    .toolbar input[type="date"],
+    .toolbar select {
+      background: var(--bg-sunken);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 6px 8px;
+      font-family: inherit;
+      font-size: 0.78rem;
+    }
+    .toolbar input:hover, .toolbar select:hover { border-color: var(--border-strong); }
+    .toolbar input:focus-visible, .toolbar select:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 1px;
+      border-color: var(--accent);
+    }
+    .toolbar input[type="search"] { flex: 1; min-width: 200px; }
+    .toolbar select { max-width: 260px; }
+    .btn {
+      background: var(--bg-sunken);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 6px 10px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 0.75rem;
+    }
+    .btn:hover { border-color: var(--accent); color: var(--accent); }
+    .btn:active { background: var(--bg-elevated); transform: translateY(1px); }
+    .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn:disabled:hover { border-color: var(--border); color: var(--text); }
+
+    /* === Summary strip === */
+    .stat-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 18px;
+      padding: 10px 12px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 14px;
+    }
+    .stat { display: flex; flex-direction: column; gap: 1px; }
+    .stat-label {
+      font-size: 0.62rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .stat-value { font-size: 0.95rem; color: var(--text-strong); font-weight: 600; }
+
+    /* === Two-pane layout === */
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(300px, 380px) minmax(0, 1fr);
+      gap: 14px;
+      align-items: start;
+    }
+    .pane {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .pane-header {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .pane-header h2 {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .list-scroll { max-height: calc(100vh - 300px); overflow-y: auto; }
+
+    /* === Session list === */
+    .session-row {
+      display: block;
+      width: 100%;
+      text-align: left;
+      background: none;
+      border: none;
+      border-bottom: 1px solid var(--border);
+      border-left: 3px solid transparent;
+      color: inherit;
+      font-family: inherit;
+      padding: 10px 12px;
+      cursor: pointer;
+    }
+    .session-row:hover { background: var(--row-hover); border-left-color: var(--border-strong); }
+    .session-row:active { background: var(--bg-sunken); }
+    .session-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+    .session-row.selected {
+      background: var(--row-hover);
+      border-left-color: var(--accent);
+    }
+    .session-title {
+      font-size: 0.82rem;
+      color: var(--text-strong);
+      font-weight: 600;
+      margin-bottom: 2px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .session-sub {
+      font-size: 0.68rem;
+      color: var(--text-muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      margin-bottom: 4px;
+    }
+    .session-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      font-size: 0.65rem;
+      color: var(--text-muted);
+    }
+    .session-meta .sep { color: var(--text-faint); }
+
+    /* === Badges / chips === */
+    .badge {
+      display: inline-block;
+      background: var(--badge-bg);
+      color: var(--badge-text);
+      border-radius: 4px;
+      padding: 1px 6px;
+      font-size: 0.62rem;
+      white-space: nowrap;
+    }
+    .badge.green { background: transparent; color: var(--green); border: 1px solid var(--green); }
+    .badge.amber { background: transparent; color: var(--amber); border: 1px solid var(--amber); }
+    .badge.red { background: transparent; color: var(--red-strong); border: 1px solid var(--red-strong); }
+    .badge.purple { background: transparent; color: var(--purple); border: 1px solid var(--purple); }
+    .badge.plain { background: transparent; color: var(--text-muted); border: 1px solid var(--border-strong); }
+
+    /* === Detail pane === */
+    .detail-empty {
+      padding: 48px 24px;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+    }
+    .detail-head { padding: 14px 16px; border-bottom: 1px solid var(--border); }
+    .detail-title {
+      font-size: 1.05rem;
+      color: var(--text-strong);
+      font-weight: 600;
+      margin-bottom: 4px;
+      overflow-wrap: anywhere;
+    }
+    .detail-path {
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      overflow-wrap: anywhere;
+      margin-bottom: 10px;
+    }
+    .chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .metric {
+      background: var(--bg-sunken);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 7px 9px;
+    }
+    .metric-label {
+      font-size: 0.6rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .metric-value { font-size: 0.88rem; color: var(--text-strong); font-weight: 600; }
+
+    /* === Transcript filters === */
+    .filter-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .fchip {
+      background: var(--bg-sunken);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      border-radius: 999px;
+      padding: 3px 10px;
+      font-size: 0.68rem;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .fchip:hover { border-color: var(--accent); color: var(--accent); }
+    .fchip:active { background: var(--bg-elevated); transform: translateY(1px); }
+    .fchip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .fchip.on {
+      background: var(--accent-strong);
+      border-color: var(--accent-strong);
+      color: var(--accent-on);
+    }
+
+    /* === Timeline === */
+    .timeline { padding: 12px 16px; max-height: calc(100vh - 300px); overflow-y: auto; }
+    .msg {
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--border-strong);
+      border-radius: 6px;
+      margin-bottom: 10px;
+      background: var(--bg-sunken);
+      overflow: hidden;
+    }
+    .msg.user { border-left-color: var(--accent); }
+    .msg.assistant { border-left-color: var(--purple); }
+    .msg.tool { border-left-color: var(--amber); }
+    .msg.system { border-left-color: var(--red-strong); }
+    .msg.meta { border-left-color: var(--text-faint); opacity: 0.85; }
+    .msg-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      padding: 7px 10px;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.68rem;
+      color: var(--text-muted);
+      background: var(--bg-elevated);
+    }
+    .msg-role {
+      font-weight: 700;
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .msg.user .msg-role { color: var(--accent); }
+    .msg.assistant .msg-role { color: var(--purple); }
+    .msg.tool .msg-role { color: var(--amber); }
+    .msg.system .msg-role { color: var(--red-strong); }
+    .msg-spacer { flex: 1; }
+    .msg-body { padding: 9px 11px; font-size: 0.78rem; }
+    .msg-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+    .icon-btn {
+      background: none;
+      border: 1px solid transparent;
+      color: var(--text-muted);
+      border-radius: 4px;
+      padding: 1px 6px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 0.65rem;
+    }
+    .icon-btn:hover { color: var(--accent); border-color: var(--border); }
+    .icon-btn:active { background: var(--bg-sunken); transform: translateY(1px); }
+    .icon-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    /* Collapsible sub-blocks */
+    details.block { border-top: 1px dashed var(--border); }
+    details.block:first-child { border-top: none; }
+    details.block > summary {
+      cursor: pointer;
+      padding: 6px 11px;
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      list-style: none;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      flex-wrap: wrap;
+    }
+    details.block > summary::-webkit-details-marker { display: none; }
+    details.block > summary::before {
+      content: '▸';
+      color: var(--text-faint);
+      flex-shrink: 0;
+    }
+    details.block[open] > summary::before { content: '▾'; }
+    details.block > summary:hover { color: var(--accent); background: var(--row-hover); }
+    details.block > summary:active { background: var(--bg-elevated); }
+    details.block > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+    .block-body { padding: 0 11px 9px 11px; }
+
+    pre.code {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 8px 10px;
+      overflow-x: auto;
+      font-size: 0.72rem;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      max-height: 420px;
+      overflow-y: auto;
+    }
+    pre.code.err { border-color: var(--red-strong); color: var(--red-strong); }
+    .thinking-text {
+      font-style: italic;
+      color: var(--text-muted);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-size: 0.74rem;
+    }
+    .trunc-note {
+      font-size: 0.65rem;
+      color: var(--amber);
+      margin-top: 5px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    /* Diff rendering for structuredPatch */
+    .diff { border: 1px solid var(--border); border-radius: 5px; overflow: hidden; }
+    .diff-hunk-head {
+      background: var(--bg-elevated);
+      color: var(--text-muted);
+      padding: 3px 8px;
+      font-size: 0.66rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .diff-line {
+      display: block;
+      padding: 0 8px;
+      font-size: 0.71rem;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .diff-line.add { background: var(--diff-add-bg); color: var(--green); }
+    .diff-line.del { background: var(--diff-del-bg); color: var(--red-strong); }
+    .diff-line.ctx { color: var(--text-muted); }
+
+    .kv-list { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 7px; }
+    .kv {
+      font-size: 0.65rem;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 1px 6px;
+      color: var(--text-muted);
+      overflow-wrap: anywhere;
+    }
+    .kv b { color: var(--text); font-weight: 600; }
+
+    .divider {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 14px 0;
+      color: var(--amber);
+      font-size: 0.68rem;
+    }
+    .divider::before, .divider::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: var(--amber);
+      opacity: 0.4;
+    }
+
+    .subagent-section { padding: 12px 16px; border-top: 1px solid var(--border); }
+    .subagent-row {
+      display: block;
+      width: 100%;
+      text-align: left;
+      background: var(--bg-sunken);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: inherit;
+      font-family: inherit;
+      padding: 8px 10px;
+      cursor: pointer;
+      margin-bottom: 6px;
+    }
+    .subagent-row:hover { border-color: var(--accent); }
+    .subagent-row:active { background: var(--bg-elevated); transform: translateY(1px); }
+    .subagent-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .subagent-desc {
+      font-size: 0.73rem;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      margin-bottom: 3px;
+    }
+
+    .error-banner {
+      background: var(--bg-elevated);
+      border: 1px solid var(--red-strong);
+      border-left: 3px solid var(--red-strong);
+      border-radius: 6px;
+      padding: 10px 12px;
+      margin-bottom: 12px;
+      font-size: 0.78rem;
+    }
+    .error-banner h3 { color: var(--red-strong); font-size: 0.82rem; margin-bottom: 4px; }
+
+    a.link { color: var(--accent); text-decoration: none; }
+    a.link:hover { text-decoration: underline; }
+    a.link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    @media (max-width: 900px) {
+      body { padding: 14px; }
+      .layout { grid-template-columns: 1fr; }
+      .list-scroll { max-height: 320px; }
+      .timeline { max-height: none; }
+      .header { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="header-left">
+      <h1>Session History</h1>
+      <nav class="nav" aria-label="Primary">
+        <a href="/">Dashboard</a>
+        <a href="/sessions" class="active">Sessions</a>
+        <a href="/account">Account</a>
+        <a href="/chat">Chat</a>
+        <a href="/api">API</a>
+      </nav>
+    </div>
+    <div class="header-right">
+      <button id="time-format-toggle" class="theme-toggle" type="button" aria-label="Toggle 12 / 24 hour time">
+        <span id="time-format-label">24h</span>
+      </button>
+      <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle theme">
+        <span id="theme-icon">🌙</span>
+        <span id="theme-label">Dark</span>
+      </button>
+    </div>
+  </div>
+
+  <div id="error-container"></div>
+
+  <div class="toolbar">
+    <input type="search" id="q" placeholder="Search titles, prompts, paths, session ids…" aria-label="Search sessions">
+    <label for="project-filter">Project</label>
+    <select id="project-filter" aria-label="Filter by project">
+      <option value="">All projects</option>
+    </select>
+    <label for="date-from">From</label>
+    <input type="date" id="date-from" aria-label="From date">
+    <label for="date-to">To</label>
+    <input type="date" id="date-to" aria-label="To date">
+    <label for="sort">Sort</label>
+    <select id="sort" aria-label="Sort order">
+      <option value="recent">Newest first</option>
+      <option value="oldest">Oldest first</option>
+      <option value="cost">Highest cost</option>
+      <option value="messages">Most messages</option>
+      <option value="tools">Most tool calls</option>
+      <option value="duration">Longest</option>
+    </select>
+    <button class="btn" id="reset-filters" type="button">Reset</button>
+  </div>
+
+  <div class="stat-strip" id="stat-strip"></div>
+
+  <div class="layout">
+    <div class="pane">
+      <div class="pane-header">
+        <h2>Sessions</h2>
+        <span class="muted" id="list-count" style="font-size:0.68rem;"></span>
+      </div>
+      <div class="list-scroll" id="session-list">
+        <div class="loading" style="padding-left:12px;">Loading sessions…</div>
+      </div>
+      <div class="pane-header" style="border-bottom:none;border-top:1px solid var(--border);">
+        <button class="btn" id="load-more" type="button" hidden>Load more</button>
+      </div>
+    </div>
+
+    <div class="pane" id="detail-pane">
+      <div class="detail-empty">Select a session to view its full transcript.</div>
+    </div>
+  </div>
+
+  <script>
+    // === Theme ===
+    const THEME_KEY = 'claude-lens-theme';
+    function getInitialTheme() {
+      const saved = localStorage.getItem(THEME_KEY);
+      if (saved === 'light' || saved === 'dark') return saved;
+      return globalThis.matchMedia && globalThis.matchMedia('(prefers-color-scheme: light)').matches
+        ? 'light' : 'dark';
+    }
+    function applyTheme(theme) {
+      document.documentElement.setAttribute('data-theme', theme);
+      const icon = document.getElementById('theme-icon');
+      const label = document.getElementById('theme-label');
+      if (icon) icon.textContent = theme === 'dark' ? '🌙' : '☀️';
+      if (label) label.textContent = theme === 'dark' ? 'Dark' : 'Light';
+    }
+    applyTheme(getInitialTheme());
+    document.getElementById('theme-toggle').addEventListener('click', () => {
+      const current = document.documentElement.getAttribute('data-theme') || 'dark';
+      const next = current === 'dark' ? 'light' : 'dark';
+      localStorage.setItem(THEME_KEY, next);
+      applyTheme(next);
+    });
+
+    // === Time format (shared preference with the dashboard) ===
+    const TIME_FORMAT_KEY = 'claude-lens-time-format';
+    let TIME_FORMAT = (() => {
+      const saved = localStorage.getItem(TIME_FORMAT_KEY);
+      return saved === '12h' || saved === '24h' ? saved : '24h';
+    })();
+    function applyTimeFormat(fmt) {
+      TIME_FORMAT = fmt;
+      document.getElementById('time-format-label').textContent = fmt;
+    }
+    applyTimeFormat(TIME_FORMAT);
+    document.getElementById('time-format-toggle').addEventListener('click', () => {
+      applyTimeFormat(TIME_FORMAT === '24h' ? '12h' : '24h');
+      localStorage.setItem(TIME_FORMAT_KEY, TIME_FORMAT);
+      renderList();
+      if (state.detail) renderDetail(state.detail);
+    });
+
+    // === Helpers ===
+    // Escapes quotes as well as angle brackets. This page interpolates
+    // transcript-derived text into *attributes* (title=, data-id=), and the
+    // usual textContent->innerHTML trick leaves " and ' untouched — which
+    // would let a crafted string in a transcript close the attribute and add
+    // its own. Transcripts contain arbitrary file and web content, so treat
+    // every value as hostile.
+    const HTML_ESCAPES = {
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    };
+    function escapeHtml(str) {
+      return String(str ?? '').replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]);
+    }
+    const fmtInt = (n) => (n == null ? '—' : Number(n).toLocaleString());
+    function fmtTokens(n) {
+      if (n == null) return '—';
+      if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+      if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+      return Number(n).toLocaleString();
+    }
+    function fmtCost(c) {
+      if (c == null) return '—';
+      if (c === 0) return '$0';
+      if (c < 0.01) return '<$0.01';
+      return '$' + c.toFixed(2);
+    }
+    function fmtBytes(b) {
+      if (b == null) return '—';
+      if (b >= 1e6) return (b / 1e6).toFixed(1) + ' MB';
+      if (b >= 1e3) return (b / 1e3).toFixed(0) + ' kB';
+      return b + ' B';
+    }
+    function fmtDuration(ms) {
+      if (ms == null || !Number.isFinite(ms)) return '—';
+      const sec = Math.floor(ms / 1000);
+      if (sec < 60) return sec + 's';
+      const min = Math.floor(sec / 60);
+      if (min < 60) return min + 'm ' + (sec % 60) + 's';
+      const hr = Math.floor(min / 60);
+      return hr + 'h ' + (min % 60) + 'm';
+    }
+    function fmtTime(ts) {
+      if (!ts) return '—';
+      const d = new Date(ts);
+      if (Number.isNaN(d.getTime())) return '—';
+      return d.toLocaleTimeString('en-GB', {
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hour12: TIME_FORMAT === '12h',
+      });
+    }
+    function fmtDateTime(ts) {
+      if (!ts) return '—';
+      const d = new Date(ts);
+      if (Number.isNaN(d.getTime())) return '—';
+      const date = d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+      return date + ' ' + fmtTime(ts);
+    }
+    function fmtRelative(ts) {
+      if (!ts) return '—';
+      const diff = Date.now() - new Date(ts).getTime();
+      if (!Number.isFinite(diff)) return '—';
+      const min = Math.floor(diff / 60000);
+      if (min < 1) return 'just now';
+      if (min < 60) return min + 'm ago';
+      const hr = Math.floor(min / 60);
+      if (hr < 24) return hr + 'h ago';
+      const day = Math.floor(hr / 24);
+      if (day < 30) return day + 'd ago';
+      const mo = Math.floor(day / 30);
+      if (mo < 12) return mo + 'mo ago';
+      return Math.floor(mo / 12) + 'y ago';
+    }
+    function shortModel(m) {
+      if (!m) return 'unknown';
+      return String(m).replace(/^claude-/, '').replace(/-\d{8}$/, '');
+    }
+    function topEntries(obj, n) {
+      return Object.entries(obj || {}).sort((a, b) => b[1] - a[1]).slice(0, n);
+    }
+    function showError(msg) {
+      document.getElementById('error-container').innerHTML =
+        `<div class="error-banner"><h3>Error</h3><p>${escapeHtml(msg)}</p></div>`;
+    }
+    function clearError() {
+      document.getElementById('error-container').innerHTML = '';
+    }
+
+    // === State ===
+    const state = {
+      sessions: [],
+      total: 0,
+      offset: 0,
+      limit: 50,
+      selectedId: null,
+      detail: null,
+      // Transcript view toggles — attachments and synthetic turns are noisy,
+      // so they start hidden.
+      show: {
+        prompts: true,
+        assistant: true,
+        thinking: true,
+        tools: true,
+        system: true,
+        attachments: false,
+      },
+      transcriptQuery: '',
+    };
+
+    function currentQuery(extra) {
+      const p = new URLSearchParams();
+      const q = document.getElementById('q').value.trim();
+      const project = document.getElementById('project-filter').value;
+      const from = document.getElementById('date-from').value;
+      const to = document.getElementById('date-to').value;
+      const sort = document.getElementById('sort').value;
+      if (q) p.set('q', q);
+      if (project) p.set('project', project);
+      if (from) p.set('from', from);
+      if (to) p.set('to', to);
+      if (sort) p.set('sort', sort);
+      p.set('limit', String(state.limit));
+      p.set('offset', String(extra?.offset ?? 0));
+      return p.toString();
+    }
+
+    async function loadSessions({ append = false } = {}) {
+      const offset = append ? state.offset + state.limit : 0;
+      try {
+        const res = await fetch('/api/session-history?' + currentQuery({ offset }));
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+        clearError();
+        state.sessions = append ? state.sessions.concat(data.sessions) : data.sessions;
+        state.total = data.total;
+        state.offset = offset;
+        if (!append) populateProjects(data.projects);
+        renderStats(data);
+        renderList();
+      } catch (err) {
+        showError('Could not load sessions: ' + err.message);
+        document.getElementById('session-list').innerHTML =
+          '<div class="loading" style="padding-left:12px;">No sessions loaded.</div>';
+      }
+    }
+
+    let projectsPopulated = false;
+    function populateProjects(projects) {
+      if (projectsPopulated) return;
+      projectsPopulated = true;
+      const sel = document.getElementById('project-filter');
+      for (const p of projects) {
+        const opt = document.createElement('option');
+        opt.value = p.project;
+        opt.textContent = `${p.cwd || p.project} (${p.count})`;
+        sel.appendChild(opt);
+      }
+    }
+
+    function renderStats(data) {
+      const t = data.totals || {};
+      const tok = t.tokens || {};
+      const totalTokens =
+        (tok.input || 0) + (tok.output || 0) + (tok.cacheRead || 0) + (tok.cacheCreate || 0);
+      const cells = [
+        ['Sessions', fmtInt(data.total)],
+        ['Prompts', fmtInt(t.userMessages)],
+        ['Replies', fmtInt(t.assistantMessages)],
+        ['Tool calls', fmtInt(t.toolCalls)],
+        ['Tokens', fmtTokens(totalTokens)],
+        ['Est. cost', fmtCost(t.cost)],
+      ];
+      document.getElementById('stat-strip').innerHTML = cells
+        .map(([l, v]) => `
+          <div class="stat">
+            <span class="stat-label">${escapeHtml(l)}</span>
+            <span class="stat-value">${escapeHtml(v)}</span>
+          </div>`)
+        .join('');
+    }
+
+    function renderList() {
+      const host = document.getElementById('session-list');
+      document.getElementById('list-count').textContent =
+        `${state.sessions.length} of ${state.total}`;
+      const more = document.getElementById('load-more');
+      more.hidden = state.sessions.length >= state.total;
+
+      if (!state.sessions.length) {
+        host.innerHTML = '<div class="loading" style="padding-left:12px;">No sessions match these filters.</div>';
+        return;
+      }
+
+      host.innerHTML = state.sessions.map((s) => {
+        const title = s.title || s.firstPrompt || '(untitled session)';
+        const cwd = s.cwd || s.project || '';
+        const models = topEntries(s.models, 2)
+          .map(([m]) => `<span class="badge">${escapeHtml(shortModel(m))}</span>`).join(' ');
+        const flags = [];
+        if (s.subagentCount) flags.push(`<span class="badge purple">${s.subagentCount} agent${s.subagentCount > 1 ? 's' : ''}</span>`);
+        if (s.errors) flags.push(`<span class="badge red">${s.errors} error${s.errors > 1 ? 's' : ''}</span>`);
+        if (s.compactions) flags.push('<span class="badge amber">compacted</span>');
+        return `
+          <button class="session-row${s.sessionId === state.selectedId ? ' selected' : ''}"
+                  type="button" data-id="${escapeHtml(s.sessionId)}">
+            <div class="session-title" title="${escapeHtml(title)}">${escapeHtml(title)}</div>
+            <div class="session-sub" title="${escapeHtml(cwd)}">${escapeHtml(cwd)}</div>
+            <div class="session-meta">
+              <span title="${escapeHtml(fmtDateTime(s.startedAt))}">${escapeHtml(fmtRelative(s.startedAt))}</span>
+              <span class="sep">·</span><span>${escapeHtml(fmtDuration(s.durationMs))}</span>
+              <span class="sep">·</span><span>${fmtInt(s.userMessages)} prompts</span>
+              <span class="sep">·</span><span>${fmtInt(s.toolCalls)} tools</span>
+              <span class="sep">·</span><span>${escapeHtml(fmtCost(s.cost))}</span>
+            </div>
+            <div class="session-meta" style="margin-top:4px;">${models} ${flags.join(' ')}</div>
+          </button>`;
+      }).join('');
+
+      for (const btn of host.querySelectorAll('.session-row')) {
+        btn.addEventListener('click', () => selectSession(btn.dataset.id));
+      }
+    }
+
+    // === Detail ===
+    async function selectSession(id, opts = {}) {
+      // A find-in-transcript term from the previous session would silently
+      // filter the new one down to nothing, which reads as "empty session".
+      state.transcriptQuery = '';
+      state.selectedId = id;
+      globalThis.location.hash = '#' + id;
+      renderList();
+      const pane = document.getElementById('detail-pane');
+      pane.innerHTML = '<div class="detail-empty">Loading transcript…</div>';
+      try {
+        const params = new URLSearchParams();
+        if (opts.agent) params.set('agent', opts.agent);
+        const url = '/api/session-history/' + encodeURIComponent(id) +
+          (params.toString() ? '?' + params.toString() : '');
+        const res = await fetch(url);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+        state.detail = data;
+        renderDetail(data);
+      } catch (err) {
+        pane.innerHTML = `<div class="detail-empty">Could not load transcript: ${escapeHtml(err.message)}</div>`;
+      }
+    }
+
+    function renderDetail(data) {
+      const s = data.session;
+      const agent = data.agent;
+      const pane = document.getElementById('detail-pane');
+
+      const title = agent
+        ? 'Subagent · ' + (agent.description || agent.agentId)
+        : (s.title || s.firstPrompt || '(untitled session)');
+
+      // When a sidechain is open, the header must describe *that* sidechain —
+      // showing the parent session's totals here reads as if the subagent
+      // burned the whole session's budget.
+      const view = agent
+        ? {
+            ...agent,
+            durationMs:
+              agent.startedAt && agent.endedAt
+                ? Date.parse(agent.endedAt) - Date.parse(agent.startedAt)
+                : null,
+          }
+        : s;
+
+      const chips = [];
+      for (const [m, c] of topEntries(view.models, 4)) {
+        chips.push(`<span class="badge">${escapeHtml(shortModel(m))} ×${c}</span>`);
+      }
+      for (const b of (s.gitBranches || [])) {
+        chips.push(`<span class="badge plain">⑂ ${escapeHtml(b)}</span>`);
+      }
+      for (const v of (s.versions || [])) {
+        chips.push(`<span class="badge plain">v${escapeHtml(v)}</span>`);
+      }
+      for (const e of (s.entrypoints || [])) {
+        chips.push(`<span class="badge plain">${escapeHtml(e)}</span>`);
+      }
+      if (view.compactions) chips.push(`<span class="badge amber">${view.compactions} compaction(s)</span>`);
+      if (view.errors) chips.push(`<span class="badge red">${view.errors} API error(s)</span>`);
+      for (const pr of (s.prLinks || [])) {
+        chips.push(`<a class="badge green" style="text-decoration:none;" href="${escapeHtml(pr.url)}" target="_blank" rel="noopener noreferrer">PR #${escapeHtml(pr.number)}</a>`);
+      }
+
+      const tok = view.tokens || {};
+      const metrics = [
+        ['Started', fmtDateTime(view.startedAt)],
+        ['Duration', fmtDuration(view.durationMs)],
+        ['Prompts', fmtInt(view.userMessages)],
+        ['Replies', fmtInt(view.assistantMessages)],
+        ['Tool calls', fmtInt(view.toolCalls)],
+        ['Thinking', fmtInt(view.thinkingBlocks)],
+        ['Input', fmtTokens(tok.input)],
+        ['Output', fmtTokens(tok.output)],
+        ['Cache read', fmtTokens(tok.cacheRead)],
+        ['Cache write', fmtTokens(tok.cacheCreate)],
+        ['Est. cost', fmtCost(view.cost)],
+        ['Transcript', fmtBytes(view.sizeBytes)],
+      ];
+
+      const toolChips = topEntries(s.tools, 8)
+        .map(([t, c]) => `<span class="kv"><b>${escapeHtml(t)}</b> ${c}</span>`).join('');
+
+      const backBtn = agent
+        ? `<button class="btn" id="back-to-session" type="button">← Back to session</button>`
+        : '';
+
+      pane.innerHTML = `
+        <div class="detail-head">
+          <div class="detail-title">${escapeHtml(title)}</div>
+          <div class="detail-path">${escapeHtml(s.cwd || s.project || '')}</div>
+          <div class="chip-row">
+            <span class="badge plain" title="Session id">${escapeHtml(s.sessionId)}</span>
+            ${chips.join(' ')}
+          </div>
+          ${toolChips ? `<div class="kv-list">${toolChips}</div>` : ''}
+          <div class="metric-grid">
+            ${metrics.map(([l, v]) => `
+              <div class="metric">
+                <div class="metric-label">${escapeHtml(l)}</div>
+                <div class="metric-value">${escapeHtml(v)}</div>
+              </div>`).join('')}
+          </div>
+        </div>
+
+        <div class="pane-header">
+          <div class="filter-chips" id="transcript-filters">
+            ${backBtn}
+            ${Object.keys(state.show).map((k) => `
+              <button class="fchip${state.show[k] ? ' on' : ''}" type="button" data-toggle="${k}"
+                      aria-pressed="${state.show[k]}">${escapeHtml(k)}</button>`).join('')}
+          </div>
+          <input type="search" id="transcript-q" placeholder="Find in transcript…"
+                 aria-label="Search within transcript"
+                 style="background:var(--bg-sunken);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:5px 8px;font-family:inherit;font-size:0.74rem;">
+        </div>
+
+        <div class="timeline" id="timeline"></div>
+        ${agent ? '' : renderSubagentSection(s)}
+      `;
+
+      const q = document.getElementById('transcript-q');
+      q.value = state.transcriptQuery;
+      q.addEventListener('input', () => {
+        state.transcriptQuery = q.value;
+        renderTimeline(data);
+      });
+      for (const btn of pane.querySelectorAll('[data-toggle]')) {
+        btn.addEventListener('click', () => {
+          const key = btn.dataset.toggle;
+          state.show[key] = !state.show[key];
+          btn.classList.toggle('on', state.show[key]);
+          btn.setAttribute('aria-pressed', String(state.show[key]));
+          renderTimeline(data);
+        });
+      }
+      const back = document.getElementById('back-to-session');
+      if (back) back.addEventListener('click', () => selectSession(s.sessionId));
+
+      for (const btn of pane.querySelectorAll('[data-agent]')) {
+        btn.addEventListener('click', () =>
+          selectSession(s.sessionId, { agent: btn.dataset.agent }));
+      }
+
+      renderTimeline(data);
+    }
+
+    function renderSubagentSection(s) {
+      if (!s.subagents || !s.subagents.length) return '';
+      const rows = s.subagents.map((a) => `
+        <button class="subagent-row" type="button" data-agent="${escapeHtml(a.agentId)}">
+          <div class="subagent-desc">${escapeHtml(a.description || '(no prompt recorded)')}</div>
+          <div class="session-meta">
+            <span class="badge purple">${escapeHtml(a.agentId)}</span>
+            <span>${fmtInt(a.assistantMessages)} replies</span>
+            <span class="sep">·</span><span>${fmtInt(a.toolCalls)} tools</span>
+            <span class="sep">·</span><span>${escapeHtml(fmtCost(a.cost))}</span>
+            <span class="sep">·</span><span>${escapeHtml(fmtDuration(
+              a.startedAt && a.endedAt ? Date.parse(a.endedAt) - Date.parse(a.startedAt) : null))}</span>
+          </div>
+        </button>`).join('');
+      return `
+        <div class="subagent-section">
+          <h2 style="font-size:0.72rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">
+            Subagents (${s.subagents.length})
+          </h2>
+          ${rows}
+        </div>`;
+    }
+
+    // Decide whether a normalized entry passes the current view toggles.
+    function messageVisible(m) {
+      if (m.type === 'attachment') return state.show.attachments;
+      if (m.type === 'system' || m.type === 'mode' || m.type === 'pr-link') return state.show.system;
+      if (m.type === 'user') {
+        if (m.isToolResult) return state.show.tools;
+        if (m.isSynthetic) return state.show.attachments;
+        return state.show.prompts;
+      }
+      if (m.type === 'assistant') {
+        const hasText = (m.blocks || []).some((b) => b.type === 'text');
+        const hasThinking = (m.blocks || []).some((b) => b.type === 'thinking');
+        const hasTool = (m.blocks || []).some((b) => b.type === 'tool_use');
+        if (hasText && state.show.assistant) return true;
+        if (hasThinking && state.show.thinking) return true;
+        if (hasTool && state.show.tools) return true;
+        return false;
+      }
+      return true;
+    }
+
+    function matchesTranscriptQuery(m, needle) {
+      if (!needle) return true;
+      const hay = JSON.stringify(m).toLowerCase();
+      return hay.includes(needle);
+    }
+
+    function renderTimeline(data) {
+      const host = document.getElementById('timeline');
+      if (!host) return;
+      const needle = state.transcriptQuery.trim().toLowerCase();
+      const visible = data.messages.filter(
+        (m) => messageVisible(m) && matchesTranscriptQuery(m, needle));
+
+      if (!visible.length) {
+        host.innerHTML = '<div class="loading">Nothing matches the current filters.</div>';
+        return;
+      }
+
+      host.innerHTML = visible.map((m) => renderMessage(m, data)).join('');
+      wireTimeline(host, data);
+    }
+
+    function renderMessage(m, data) {
+      if (m.type === 'system' && m.subtype === 'compact_boundary') {
+        const trigger = m.compactMetadata?.trigger;
+        return `<div class="divider">Conversation compacted${trigger ? ` (${escapeHtml(trigger)})` : ''} · ${escapeHtml(fmtTime(m.timestamp))}</div>`;
+      }
+
+      let cls = 'meta';
+      let role = m.type;
+      if (m.type === 'user') {
+        if (m.isToolResult) { cls = 'tool'; role = 'tool result'; }
+        else if (m.isSynthetic) { cls = 'meta'; role = 'system turn'; }
+        else { cls = 'user'; role = 'you'; }
+      } else if (m.type === 'assistant') {
+        cls = 'assistant'; role = 'claude';
+      } else if (m.type === 'system') {
+        cls = 'system'; role = m.subtype || 'system';
+      }
+
+      const head = [];
+      head.push(`<span class="msg-role">${escapeHtml(role)}</span>`);
+      if (m.model) head.push(`<span class="badge">${escapeHtml(shortModel(m.model))}</span>`);
+      if (m.effort) head.push(`<span class="badge plain">effort: ${escapeHtml(m.effort)}</span>`);
+      if (m.attributionSkill) head.push(`<span class="badge purple">skill: ${escapeHtml(m.attributionSkill)}</span>`);
+      if (m.attributionMcpServer) head.push(`<span class="badge purple">mcp: ${escapeHtml(m.attributionMcpServer)}</span>`);
+      if (m.stopReason && m.stopReason !== 'end_turn') {
+        head.push(`<span class="badge amber">${escapeHtml(m.stopReason)}</span>`);
+      }
+      head.push('<span class="msg-spacer"></span>');
+      if (m.tokens) {
+        const t = m.tokens;
+        const title = `in ${fmtInt(t.input)} · out ${fmtInt(t.output)} · cache read ${fmtInt(t.cacheRead)} · cache write ${fmtInt(t.cacheCreate)}`;
+        head.push(`<span title="${escapeHtml(title)}">${escapeHtml(fmtTokens(t.output))} out · ${escapeHtml(fmtCost(m.cost))}</span>`);
+      }
+      head.push(`<span title="${escapeHtml(fmtDateTime(m.timestamp))}">${escapeHtml(fmtTime(m.timestamp))}</span>`);
+      if (m.uuid) {
+        head.push(`<button class="icon-btn" type="button" data-raw="${escapeHtml(m.uuid)}" title="Show the raw JSONL entry">{ }</button>`);
+      }
+
+      const body = [];
+      for (const b of (m.blocks || [])) {
+        body.push(renderBlock(b, m));
+      }
+      if (m.toolResultMeta) body.push(renderToolResultMeta(m.toolResultMeta, m));
+      if (m.type === 'system') body.push(renderSystemBody(m));
+      if (m.type === 'attachment') {
+        body.push(`<div class="msg-body"><span class="badge plain">${escapeHtml(m.attachmentType || 'attachment')}</span>
+          <div class="msg-text faint" style="margin-top:5px;">${escapeHtml(m.detail || '')}</div></div>`);
+      }
+      if (m.type === 'mode') {
+        body.push(`<div class="msg-body">Mode set to <span class="badge">${escapeHtml(m.mode)}</span></div>`);
+      }
+      if (m.type === 'pr-link') {
+        body.push(`<div class="msg-body">Pull request
+          <a class="link" href="${escapeHtml(m.prUrl)}" target="_blank" rel="noopener noreferrer">
+            ${escapeHtml(m.prRepository || '')}#${escapeHtml(m.prNumber)}</a></div>`);
+      }
+
+      return `
+        <div class="msg ${cls}" data-uuid="${escapeHtml(m.uuid || '')}">
+          <div class="msg-head">${head.join('')}</div>
+          ${body.join('')}
+          <div class="raw-host" hidden></div>
+        </div>`;
+    }
+
+    function truncNote(b, m) {
+      if (!b.truncated) return '';
+      const shown = b.text.length;
+      return `<div class="trunc-note">
+        Showing ${fmtInt(shown)} of ${fmtInt(b.length)} characters.
+        <button class="icon-btn" type="button" data-expand="${escapeHtml(m.uuid || '')}">Load full block</button>
+      </div>`;
+    }
+
+    function renderBlock(b, m) {
+      switch (b.type) {
+        case 'text':
+          return `<div class="msg-body"><div class="msg-text">${escapeHtml(b.text)}</div>${truncNote(b, m)}</div>`;
+        case 'thinking':
+          return `<details class="block">
+            <summary>Thinking · ${fmtInt(b.length)} chars</summary>
+            <div class="block-body"><div class="thinking-text">${escapeHtml(b.text)}</div>${truncNote(b, m)}</div>
+          </details>`;
+        case 'tool_use': {
+          let preview = '';
+          try {
+            const parsed = JSON.parse(b.text);
+            preview = parsed.command || parsed.file_path || parsed.pattern ||
+              parsed.description || parsed.path || parsed.prompt || '';
+          } catch { preview = ''; }
+          preview = String(preview).split('\n')[0].slice(0, 90);
+          return `<details class="block">
+            <summary><span class="badge amber">${escapeHtml(b.name || 'tool')}</span>
+              <span class="faint">${escapeHtml(preview)}</span></summary>
+            <div class="block-body"><pre class="code">${escapeHtml(b.text)}</pre>${truncNote(b, m)}</div>
+          </details>`;
+        }
+        case 'tool_result':
+          return `<details class="block">
+            <summary>${b.isError ? '<span class="badge red">error</span>' : '<span class="badge green">result</span>'}
+              <span class="faint">${fmtInt(b.length)} chars</span></summary>
+            <div class="block-body"><pre class="code${b.isError ? ' err' : ''}">${escapeHtml(b.text)}</pre>${truncNote(b, m)}</div>
+          </details>`;
+        case 'image':
+          return `<div class="msg-body"><span class="badge purple">image</span>
+            <span class="faint">${escapeHtml(b.mediaType || '')} · ${escapeHtml(fmtBytes(b.approxBytes))}</span></div>`;
+        default:
+          return `<details class="block">
+            <summary>${escapeHtml(b.type)}</summary>
+            <div class="block-body"><pre class="code">${escapeHtml(b.text || '')}</pre></div>
+          </details>`;
+      }
+    }
+
+    function renderToolResultMeta(meta, m) {
+      const kvs = [];
+      const simple = ['kind', 'filePath', 'numFiles', 'numLines', 'totalFiles', 'totalMatches',
+        'durationMs', 'mode', 'status', 'resolvedModel', 'interrupted', 'userModified',
+        'replaceAll', 'truncated'];
+      for (const k of simple) {
+        if (meta[k] !== undefined) {
+          kvs.push(`<span class="kv"><b>${escapeHtml(k)}</b> ${escapeHtml(String(meta[k]))}</span>`);
+        }
+      }
+      const parts = [];
+      if (kvs.length) parts.push(`<div class="kv-list">${kvs.join('')}</div>`);
+
+      if (meta.agentId) {
+        parts.push(`<div class="kv-list">
+          <button class="icon-btn" type="button" data-agent="${escapeHtml(meta.agentId)}"
+                  style="border-color:var(--border);">Open subagent transcript →</button></div>`);
+      }
+      if (meta.patch) {
+        parts.push(renderPatch(meta));
+      }
+      if (meta.stdout?.text) {
+        parts.push(`<div style="margin-top:6px;"><div class="metric-label">stdout</div>
+          <pre class="code">${escapeHtml(meta.stdout.text)}</pre></div>`);
+      }
+      if (meta.stderr?.text) {
+        parts.push(`<div style="margin-top:6px;"><div class="metric-label">stderr</div>
+          <pre class="code err">${escapeHtml(meta.stderr.text)}</pre></div>`);
+      }
+      if (meta.filenames?.length) {
+        parts.push(`<div style="margin-top:6px;"><div class="metric-label">files</div>
+          <pre class="code">${escapeHtml(meta.filenames.join('\n'))}</pre></div>`);
+      }
+      if (!parts.length) return '';
+      return `<details class="block">
+        <summary>Tool metadata${meta.patch ? ' · diff' : ''}</summary>
+        <div class="block-body">${parts.join('')}</div>
+      </details>`;
+    }
+
+    function renderPatch(meta) {
+      const hunks = meta.patch.map((h) => {
+        const lines = h.lines.map((l) => {
+          const c = l.startsWith('+') ? 'add' : l.startsWith('-') ? 'del' : 'ctx';
+          return `<span class="diff-line ${c}">${escapeHtml(l)}</span>`;
+        }).join('');
+        return `<div class="diff-hunk-head">@@ -${h.oldStart},${h.oldLines} +${h.newStart},${h.newLines} @@</div>${lines}`;
+      }).join('');
+      const note = meta.patchTruncated
+        ? `<div class="trunc-note">Showing ${meta.patch.length} of ${meta.patchTruncated} hunks.</div>`
+        : '';
+      return `<div style="margin-top:6px;"><div class="diff">${hunks}</div>${note}</div>`;
+    }
+
+    function renderSystemBody(m) {
+      const parts = [];
+      if (m.error) {
+        parts.push(`<div class="msg-body"><pre class="code err">${escapeHtml(m.error.message)}</pre>
+          <div class="kv-list" style="margin-top:6px;">
+            ${m.error.status ? `<span class="kv"><b>status</b> ${escapeHtml(m.error.status)}</span>` : ''}
+            ${m.error.requestId ? `<span class="kv"><b>request</b> ${escapeHtml(m.error.requestId)}</span>` : ''}
+          </div></div>`);
+      }
+      if (m.content?.text) {
+        parts.push(`<div class="msg-body"><div class="msg-text">${escapeHtml(m.content.text)}</div></div>`);
+      }
+      return parts.join('');
+    }
+
+    function wireTimeline(host, data) {
+      // Expand a truncated block by refetching just this one entry uncapped.
+      for (const btn of host.querySelectorAll('[data-expand]')) {
+        btn.addEventListener('click', async () => {
+          const uuid = btn.dataset.expand;
+          btn.disabled = true;
+          btn.textContent = 'Loading…';
+          try {
+            const full = await fetchSingle(uuid, data, false);
+            if (full) {
+              const idx = data.messages.findIndex((x) => x.uuid === uuid);
+              if (idx >= 0) data.messages[idx] = full;
+              renderTimeline(data);
+            }
+          } catch (err) {
+            btn.textContent = 'Failed: ' + err.message;
+          }
+        });
+      }
+      // Raw JSONL entry for one message.
+      for (const btn of host.querySelectorAll('[data-raw]')) {
+        btn.addEventListener('click', async () => {
+          const msgEl = btn.closest('.msg');
+          const rawHost = msgEl.querySelector('.raw-host');
+          if (!rawHost.hidden) {
+            rawHost.hidden = true;
+            rawHost.innerHTML = '';
+            return;
+          }
+          rawHost.hidden = false;
+          rawHost.innerHTML = '<div class="block-body faint">Loading raw entry…</div>';
+          try {
+            const full = await fetchSingle(btn.dataset.raw, data, true);
+            rawHost.innerHTML = `<div class="block-body">
+              <pre class="code">${escapeHtml(JSON.stringify(full?.raw ?? {}, null, 2))}</pre></div>`;
+          } catch (err) {
+            rawHost.innerHTML = `<div class="block-body faint">${escapeHtml(err.message)}</div>`;
+          }
+        });
+      }
+      // "Open subagent transcript" buttons rendered inside tool metadata.
+      for (const btn of host.querySelectorAll('[data-agent]')) {
+        btn.addEventListener('click', () =>
+          selectSession(data.session.sessionId, { agent: btn.dataset.agent }));
+      }
+    }
+
+    async function fetchSingle(uuid, data, withRaw) {
+      const p = new URLSearchParams({ uuid, full: '1' });
+      if (withRaw) p.set('raw', '1');
+      if (data.agent) p.set('agent', data.agent.agentId);
+      const res = await fetch(
+        '/api/session-history/' + encodeURIComponent(data.session.sessionId) + '?' + p.toString());
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || ('HTTP ' + res.status));
+      return json.messages[0];
+    }
+
+    // === Wiring ===
+    let searchTimer;
+    document.getElementById('q').addEventListener('input', () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => loadSessions(), 220);
+    });
+    for (const id of ['project-filter', 'date-from', 'date-to', 'sort']) {
+      document.getElementById(id).addEventListener('change', () => loadSessions());
+    }
+    document.getElementById('reset-filters').addEventListener('click', () => {
+      document.getElementById('q').value = '';
+      document.getElementById('project-filter').value = '';
+      document.getElementById('date-from').value = '';
+      document.getElementById('date-to').value = '';
+      document.getElementById('sort').value = 'recent';
+      loadSessions();
+    });
+    document.getElementById('load-more').addEventListener('click', () => loadSessions({ append: true }));
+
+    // Deep link: #<sessionId> opens that session directly.
+    globalThis.addEventListener('hashchange', () => {
+      const id = globalThis.location.hash.slice(1);
+      if (id && id !== state.selectedId) selectSession(id);
+    });
+
+    (async () => {
+      await loadSessions();
+      const id = globalThis.location.hash.slice(1);
+      if (id) selectSession(id);
+    })();
+  </script>
+</body>
+</html>

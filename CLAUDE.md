@@ -6,7 +6,7 @@ Guidance for Claude Code when working in this repository.
 
 `claude-lens` is a small local dashboard (single Express server + single static HTML page) that visualizes Claude Code usage data. It reads files written by the Claude Code CLI inside the user's Claude data directory and renders sessions, prompts, tool calls, daily costs, and cache performance in the browser.
 
-There is no build step, no framework, no database. The whole product is a few files: [server.js](server.js), [index.html](index.html), [account.html](account.html), [chat.html](chat.html), and [api.html](api.html).
+There is no build step, no framework, no database. The whole product is a few files: [server.js](server.js), [index.html](index.html), [account.html](account.html), [chat.html](chat.html), [sessions.html](sessions.html), and [api.html](api.html).
 
 ## Architecture
 
@@ -14,6 +14,7 @@ There is no build step, no framework, no database. The whole product is a few fi
 - **[index.html](index.html)** — Single-page dashboard. Plain HTML/CSS/JS, no bundler. Fetches JSON from the API endpoints and renders tables/cards. Uses CSS custom properties for light/dark theming, persisted in `localStorage`.
 - **[account.html](account.html)** — Account / login-status page. Renders the safe fields returned by `/api/account` (login state, plan, token expiry, scopes, profile, organization, application). Linked from the top nav.
 - **[chat.html](chat.html)** — Chat page. Streaming conversation with the user's account models via `POST /api/chat`. Multi-conversation persistence (each conv stored under its own `claude-lens-chat-conv-<id>` key, with an index at `claude-lens-chat-convs` and the active id at `claude-lens-chat-active-id`). Multimodal uploads (images / PDFs / text via paperclip, drag-drop, or paste — encoded as Anthropic content blocks on the wire, not persisted in `localStorage`). Advanced settings drawer for `max_tokens`, `temperature`, `top_p`, history budget, and a custom system addendum. Each assistant message is stamped with the model used and a timestamp.
+- **[sessions.html](sessions.html)** — Session history browser. Two-pane: a searchable/filterable/sortable session list on the left, a full normalized transcript on the right (prompts, replies, thinking, tool calls + inputs, tool results, `structuredPatch` diffs, sub-agent sidechains, API errors, compaction boundaries). View-toggle chips, find-in-transcript, on-demand expansion of truncated blocks, and a raw-JSONL viewer per message. Deep-linkable via `#<sessionId>`. Reads local files only — no inference, no cost. Served at `/sessions`.
 - **[api.html](api.html)** — OpenAI-compatible API page. Combined live playground (request builder with text + image attachments, response viewer), **Stress test** panel (configurable concurrency / total / max-tokens, live counters + percentile latency + per-request log + final summary, server-driven cancel via `AbortController`), code snippets, and reference docs. Linked from the top nav. Served at both `/api` (explicit route) and `/api.html` (static fallback).
 - **[.env.example](.env.example)** — Template for `.env`. Configures `CLAUDE_DIR`, pricing rates, and the optional `LOCAL_API_KEY` for the `/v1/*` endpoints.
 
@@ -24,7 +25,7 @@ There is no build step, no framework, no database. The whole product is a few fi
 | `stats-cache.json`      | `/api/stats`                           |
 | `history.jsonl`         | `/api/history`, `/api/projects`        |
 | `sessions/*.json`       | `/api/sessions`                        |
-| `projects/**/*.jsonl`   | `/api/tool-calls`, `/api/tool-details/:tool`, `/api/daily-costs`, `/api/history` |
+| `projects/**/*.jsonl`   | `/api/tool-calls`, `/api/tool-details/:tool`, `/api/daily-costs`, `/api/history`, `/api/session-history`, `/api/session-history/:id` |
 | `.credentials.json` *(Windows)*<br>macOS Keychain *(macOS)*<br>libsecret *(Linux)* | `/api/account`, `/api/chat`, `/api/ai-insight`, `/v1/chat/completions` — safe fields only over the wire (see below). All four go through `readClaudeCredentials()`, which tries the file first, then the platform-native secret store (service `Claude Code-credentials`). |
 
 ### API endpoints
@@ -43,7 +44,20 @@ There is no build step, no framework, no database. The whole product is a few fi
 - `POST /api/ai-insight` — generates a short paragraph for one of the pre-defined dashboard insight kinds (`daily-summary`, `project-narrative`, `cache-diagnosis`, `tool-summary`, `conversation-title`, `conversation-summary`, `ask`, `cost-forecast`, `standup-prep`, `conversation-compact`). Body: `{kind, context}`. Each kind has a registered template in `AI_INSIGHTS` mapping to (system prompt, user-message formatter, max_tokens). Always uses Haiku 4.5 (`AI_MODEL`) for cost control. Stateless — caching is the caller's job (the dashboard caches by `(kind, hashed-context)` in `localStorage`, exposed via the shared client helper `mountAIInsight`). Same OAuth-credential path as `/api/chat`; same load-bearing Claude-Code system marker is injected.
 - `GET /api/stats` — returns `stats-cache.json` as-is.
 - `GET /api/history` — flattened entries from `history.jsonl`.
-- `GET /api/sessions` — array of session JSONs.
+- `GET /api/sessions` — array of session JSONs (from `sessions/*.json`). Unrelated to `/api/session-history` below, which reconstructs conversations from `projects/`.
+- `GET /sessions` — serves `sessions.html`.
+- `GET /api/session-history` — index of every session reconstructed from `projects/**/*.jsonl`, one row per session. Query: `q`, `project`, `from`, `to`, `sort` (`recent`|`oldest`|`cost`|`messages`|`tools`|`duration`), `limit` (max 500), `offset`. Returns `{sessions, total, totals, projects, rates, timezone, ...}`.
+- `GET /api/session-history/:id` — full normalized transcript for one session. Query: `full=1` (no truncation), `raw=1` (include the source JSONL entry), `uuid=<messageUuid>` (just that entry — how the UI expands one truncated block without refetching megabytes), `agent=<agentId>` (a sub-agent sidechain instead of the main thread).
+
+### Session-history internals
+
+Three things about this code are load-bearing and easy to break:
+
+1. **Sub-agent files carry the parent's `sessionId`.** On disk, `projects/<proj>/<sessionId>.jsonl` is the main transcript and `projects/<proj>/<sessionId>/subagents/agent-<agentId>.jsonl` are its `Task` sidechains — all stamped with the *same* `sessionId`. Grouping by `sessionId` alone silently interleaves sub-agent turns into the main timeline. `isSubagentTranscript()` splits them out into `subagents[]`; their token counts still roll into the session totals (it's real billed traffic) but their turns are fetched separately.
+2. **The index is memoised by `(mtimeMs, size)` per file.** A cold build parses every transcript (~260 MB / ~1 s on a heavy user's machine); warm rebuilds are one `statSync` per file (~13 ms). `getSessionIndex()` wraps it in a single-flight promise so concurrent page loads share one rebuild. If you add a field to `summarizeSessionFile()`, stale cache entries persist for unchanged files until the process restarts — that's fine in dev (nodemon) but worth remembering.
+3. **Transcript data is untrusted.** It contains whatever Claude read from disk or the web. `sessions.html` therefore uses a **quote-escaping** `escapeHtml()` (regex-based, escapes `& < > " '`) rather than the `textContent`→`innerHTML` idiom used elsewhere in the codebase — that idiom leaves `"` and `'` intact, which is unsafe for the `title="…"` / `data-*="…"` attributes this page builds from transcript text. Keep it that way, and prefer it for any new attribute interpolation.
+
+Payload shaping: text / thinking / tool blocks are capped at `SESSION_BLOCK_CAP` (2 000 chars), `structuredPatch` at `SESSION_PATCH_HUNK_CAP` hunks. An 18 MB transcript lands at ~1.9 MB of JSON. `toolUseResult` goes through `projectToolUseResult()` — an explicit allow-list mapper, same projection rule as `projectProfile()`. Internal absolute paths (`_mainPath`, `_path`) are stripped by `publicSession()` and never cross the wire; ids from the request are resolved *through* the index rather than concatenated into a path.
 - `GET /api/tool-calls` — aggregate tool counts across all projects + per-project breakdown.
 - `GET /api/tool-details/:toolName` — per-call detail rows for one tool, sorted by timestamp desc.
 - `GET /api/projects` — project-level summary (messages, sessions, first/last seen).
