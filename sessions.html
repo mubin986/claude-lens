@@ -177,6 +177,9 @@
     .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .btn:disabled:hover { border-color: var(--border); color: var(--text); }
+    .context-status { font-size: 0.68rem; color: var(--text-muted); min-height: 1em; }
+    .context-status.ok { color: var(--green); }
+    .context-status.error { color: var(--red-strong); }
 
     /* === Summary strip === */
     .stat-strip {
@@ -994,6 +997,12 @@
             <span class="badge plain" title="Session id">${escapeHtml(s.sessionId)}</span>
             ${chips.join(' ')}
           </div>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px;">
+            <button class="btn" id="copy-context" type="button" title="Copy a deterministic context handoff for another coding agent">
+              Copy coding context
+            </button>
+            <span class="context-status" id="context-status" role="status" aria-live="polite"></span>
+          </div>
           ${toolChips ? `<div class="kv-list">${toolChips}</div>` : ''}
           <div class="metric-grid">
             ${metrics.map(([l, v]) => `
@@ -1037,6 +1046,7 @@
       }
       const back = document.getElementById('back-to-session');
       if (back) back.addEventListener('click', () => selectSession(s.sessionId));
+      document.getElementById('copy-context').addEventListener('click', () => copyCodingContext(data));
 
       for (const btn of pane.querySelectorAll('[data-agent]')) {
         btn.addEventListener('click', () =>
@@ -1044,6 +1054,90 @@
       }
 
       renderTimeline(data);
+    }
+
+    function contextText(value, maxLength = 6000) {
+      const text = String(value ?? '').trim();
+      if (text.length <= maxLength) return text;
+      return text.slice(0, maxLength) + `\n[truncated; original length ${text.length} characters]`;
+    }
+
+    function messageContextParts(m) {
+      const parts = [];
+      for (const b of (m.blocks || [])) {
+        if (b.type === 'text') parts.push(contextText(b.text));
+        if (b.type === 'tool_use') {
+          parts.push(`Tool call: ${b.name || 'unknown'}\n${contextText(b.text)}`);
+        }
+        if (b.type === 'tool_result') {
+          parts.push(`Tool result${b.isError ? ' (error)' : ''}:\n${contextText(b.text)}`);
+        }
+      }
+      if (m.toolResultMeta?.filePath) parts.push(`File: ${m.toolResultMeta.filePath}`);
+      if (m.toolResultMeta?.patch) {
+        const diff = m.toolResultMeta.patch.flatMap((h) => h.lines || []).join('\n');
+        if (diff) parts.push(`Recorded diff:\n${contextText(diff)}`);
+      }
+      if (m.type === 'attachment' && m.detail) parts.push(`Attachment: ${m.detail}`);
+      if (m.type === 'system' && m.content?.text) parts.push(contextText(m.content.text));
+      return parts.filter(Boolean);
+    }
+
+    function buildCodingContext(data) {
+      const s = data.session || {};
+      const viewTitle = data.agent
+        ? `Subagent: ${data.agent.description || data.agent.agentId}`
+        : (s.title || s.firstPrompt || '(untitled session)');
+      const messages = (data.messages || []).filter((m) => {
+        if (m.type === 'system' && m.subtype === 'compact_boundary') return false;
+        return messageContextParts(m).length > 0;
+      });
+      const selected = messages.slice(-40);
+      const omitted = messages.length - selected.length;
+      const lines = [
+        '# Coding agent context',
+        '',
+        `Session: ${viewTitle}`,
+        `Session ID: ${s.sessionId || 'unknown'}`,
+        `Working directory: ${s.cwd || s.project || 'unknown'}`,
+      ];
+      if (s.gitBranches?.length) lines.push(`Git branches: ${s.gitBranches.join(', ')}`);
+      if (s.versions?.length) lines.push(`Claude Code versions: ${s.versions.join(', ')}`);
+      lines.push('', '## Transcript');
+      if (omitted > 0) lines.push(`[${omitted} earlier entries omitted; context includes the latest ${selected.length}]`, '');
+
+      for (const m of selected) {
+        const role = m.type === 'user' ? (m.isToolResult ? 'Tool result' : 'User')
+          : m.type === 'assistant' ? 'Assistant' : (m.type || 'Event');
+        const parts = messageContextParts(m);
+        lines.push(`### ${role}${m.model ? ` (${shortModel(m.model)})` : ''}`);
+        lines.push(parts.join('\n\n'), '');
+      }
+
+      const maxTotalLength = 50000;
+      const result = lines.join('\n');
+      return result.length <= maxTotalLength
+        ? result
+        : result.slice(0, maxTotalLength) + '\n\n[context truncated at 50,000 characters]';
+    }
+
+    async function copyCodingContext(data) {
+      const button = document.getElementById('copy-context');
+      const status = document.getElementById('context-status');
+      if (!button || !status) return;
+      button.disabled = true;
+      status.className = 'context-status';
+      status.textContent = 'Copying…';
+      try {
+        await navigator.clipboard.writeText(buildCodingContext(data));
+        status.className = 'context-status ok';
+        status.textContent = 'Copied to clipboard';
+      } catch (err) {
+        status.className = 'context-status error';
+        status.textContent = 'Could not copy: ' + err.message;
+      } finally {
+        button.disabled = false;
+      }
     }
 
     function renderSubagentSection(s) {

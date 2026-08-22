@@ -166,7 +166,7 @@ The [/sessions](http://localhost:3456/sessions) page reads your transcripts stra
 
 **Left pane — the session list.** One row per session with its AI-generated title (or first prompt), project path, relative start time, duration, prompt/tool counts, estimated cost, models used, and badges for sub-agents, API errors, and compactions. Search matches titles, first/last prompts, working directories, and session ids. Results paginate 50 at a time.
 
-**Right pane — the transcript.** Header metrics (duration, prompts, replies, tool calls, thinking blocks, token split, cost, transcript size) plus chips for models, git branches, CLI versions, entrypoints, and any linked PRs. Below that, the timeline:
+**Right pane — the transcript.** Header metrics (duration, prompts, replies, tool calls, thinking blocks, token split, cost, transcript size) plus chips for models, git branches, CLI versions, entrypoints, and any linked PRs. **Copy coding context** copies a deterministic, bounded Markdown handoff containing session metadata and the latest transcript entries, tool inputs/results, and recorded diffs. It uses no AI and makes no additional network request. Below that, the timeline:
 
 | Entry | Rendered as |
 |-------|-------------|
